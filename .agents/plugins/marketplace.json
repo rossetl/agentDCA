@@ -1,0 +1,21 @@
+{
+  "name": "agentdca",
+  "interface": {
+    "displayName": "agentDCA"
+  },
+  "plugins": [
+    {
+      "name": "agentdca",
+      "source": {
+        "source": "url",
+        "url": "ssh://git@github.com/rossetl/agentDCA.git",
+        "ref": "main"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

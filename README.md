@@ -23,6 +23,48 @@ agent can discover and call. The initial tool set covers:
 The project currently installs adabmDCA from its `agent-api` branch. This can
 move to a released package constraint after those APIs are published.
 
+## Install in Codex
+
+Because this repository is private, first confirm that GitHub SSH access and
+`uv` are available on the machine running Codex:
+
+```bash
+ssh -T git@github.com
+uv --version
+```
+
+Register the repository as a Codex marketplace and install the plugin:
+
+```bash
+codex plugin marketplace add \
+  ssh://git@github.com/rossetl/agentDCA.git \
+  --ref main
+codex plugin add agentdca@agentdca
+```
+
+To install through the desktop interface instead, restart the Codex/ChatGPT
+desktop app after adding the marketplace, open the Plugins Directory, select
+the `agentDCA` source, and install `agentDCA`.
+
+Start a new task after installation so Codex loads the bundled skill and MCP
+tools. For example:
+
+```text
+Use agentDCA to inspect this DCA model and summarize its metadata.
+```
+
+The first MCP server launch uses `uv` to resolve the Python environment and may
+take longer while it downloads adabmDCA and its dependencies. Verify the
+configured marketplace or refresh it later with:
+
+```bash
+codex plugin marketplace list
+codex plugin marketplace upgrade agentdca
+```
+
+Plugin releases should increment the version in
+`.codex-plugin/plugin.json` so Codex installs the updated package cleanly.
+
 ## Development setup
 
 ```bash
@@ -45,6 +87,7 @@ development logging so the MCP transport is not corrupted.
 ## Plugin structure
 
 ```text
+.agents/plugins/marketplace.json  Private Codex marketplace catalog
 .codex-plugin/plugin.json  Plugin identity and presentation metadata
 .mcp.json                  Bundled MCP server launch configuration
 skills/dca-analysis/       Agent workflow and interpretation guidance
