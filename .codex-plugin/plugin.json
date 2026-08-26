@@ -1,0 +1,28 @@
+{
+  "name": "agentdca",
+  "version": "0.1.0",
+  "description": "Agent tools for Direct Coupling Analysis with adabmDCA.",
+  "author": {
+    "name": "Lorenzo Rosset"
+  },
+  "homepage": "https://github.com/rossetl/agentDCA",
+  "repository": "https://github.com/rossetl/agentDCA",
+  "keywords": ["bioinformatics", "dca", "proteins", "sequences", "mcp"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "agentDCA",
+    "shortDescription": "Analyze sequence alignments and DCA models.",
+    "longDescription": "Use adabmDCA through structured agent tools for preprocessing alignments, training models, scoring sequences, predicting contacts, scanning mutations, and sampling sequences.",
+    "developerName": "Lorenzo Rosset",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write", "Compute"],
+    "websiteURL": "https://github.com/rossetl/agentDCA",
+    "defaultPrompt": [
+      "Inspect this DCA model and summarize its metadata.",
+      "Preprocess this alignment for DCA training.",
+      "Score these sequences with my DCA model."
+    ],
+    "brandColor": "#275D38"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "agentdca": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "${PLUGIN_ROOT}/pyproject.toml",
+        "agentdca-mcp"
+      ]
+    }
+  }
+}
