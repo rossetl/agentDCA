@@ -39,6 +39,15 @@ codex plugin marketplace add rossetl/agentDCA --ref main
 codex plugin add agentdca@agentdca
 ```
 
+If you previously registered the marketplace with the private SSH URL, replace
+that saved source with the public one before reinstalling:
+
+```bash
+codex plugin marketplace remove agentdca
+codex plugin marketplace add rossetl/agentDCA --ref main
+codex plugin add agentdca@agentdca
+```
+
 To install through the desktop interface instead, restart the Codex/ChatGPT
 desktop app after adding the marketplace, open the Plugins Directory, select
 the `agentDCA` source, and install `agentDCA`.
