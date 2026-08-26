@@ -8,7 +8,7 @@
       "name": "agentdca",
       "source": {
         "source": "url",
-        "url": "ssh://git@github.com/rossetl/agentDCA.git",
+        "url": "https://github.com/rossetl/agentDCA.git",
         "ref": "main"
       },
       "policy": {

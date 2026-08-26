@@ -1,6 +1,6 @@
 # agentDCA
 
-Private, early-stage agent plugin and MCP server for
+Open-source, early-stage agent plugin and MCP server for
 [adabmDCA](https://github.com/spqb/adabmDCApy).
 
 agentDCA exposes the high-level adabmDCA Python API as structured tools that an
@@ -25,20 +25,17 @@ move to a released package constraint after those APIs are published.
 
 ## Install in Codex
 
-Because this repository is private, first confirm that GitHub SSH access and
-`uv` are available on the machine running Codex:
+Because the repository is public, no GitHub authentication is required. Confirm
+that `uv` is available on the machine running Codex:
 
 ```bash
-ssh -T git@github.com
 uv --version
 ```
 
 Register the repository as a Codex marketplace and install the plugin:
 
 ```bash
-codex plugin marketplace add \
-  ssh://git@github.com/rossetl/agentDCA.git \
-  --ref main
+codex plugin marketplace add rossetl/agentDCA --ref main
 codex plugin add agentdca@agentdca
 ```
 
@@ -68,7 +65,7 @@ Plugin releases should increment the version in
 ## Development setup
 
 ```bash
-git clone git@github.com:rossetl/agentDCA.git
+git clone https://github.com/rossetl/agentDCA.git
 cd agentDCA
 uv sync --extra dev
 uv run pytest
@@ -87,7 +84,7 @@ development logging so the MCP transport is not corrupted.
 ## Plugin structure
 
 ```text
-.agents/plugins/marketplace.json  Private Codex marketplace catalog
+.agents/plugins/marketplace.json  Codex marketplace catalog
 .codex-plugin/plugin.json  Plugin identity and presentation metadata
 .mcp.json                  Bundled MCP server launch configuration
 skills/dca-analysis/       Agent workflow and interpretation guidance
@@ -110,5 +107,5 @@ uv run --project ${PLUGIN_ROOT}/pyproject.toml agentdca-mcp
 
 ## Status
 
-This repository is private and under active development. The tool schemas and
-installation workflow may change before the first public release.
+This repository is public and under active development. The tool schemas and
+installation workflow may change before the first stable release.

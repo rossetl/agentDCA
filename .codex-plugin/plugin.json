@@ -1,12 +1,13 @@
 {
   "name": "agentdca",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Agent tools for Direct Coupling Analysis with adabmDCA.",
   "author": {
     "name": "Lorenzo Rosset"
   },
   "homepage": "https://github.com/rossetl/agentDCA",
   "repository": "https://github.com/rossetl/agentDCA",
+  "license": "Apache-2.0",
   "keywords": ["bioinformatics", "dca", "proteins", "sequences", "mcp"],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
