@@ -4,6 +4,7 @@
       "command": "uv",
       "args": [
         "run",
+        "--locked",
         "--project",
         "${PLUGIN_ROOT}/pyproject.toml",
         "agentdca-mcp"

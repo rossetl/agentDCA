@@ -90,6 +90,12 @@ uv run agentdca-mcp
 The server writes protocol messages to standard output. Use standard error for
 development logging so the MCP transport is not corrupted.
 
+Verify that every public tool is registered before packaging a release:
+
+```bash
+uv run --extra dev pytest
+```
+
 ## Plugin structure
 
 ```text
@@ -103,8 +109,21 @@ src/agentdca/server.py     MCP tool implementation
 The bundled configuration launches the server with:
 
 ```text
-uv run --project ${PLUGIN_ROOT}/pyproject.toml agentdca-mcp
+uv run --locked --project ${PLUGIN_ROOT}/pyproject.toml agentdca-mcp
 ```
+
+## Output safety
+
+- Writing tools refuse to replace existing managed artifacts unless
+  `overwrite=true` is explicit.
+- Sequence scoring can persist every record with `output_csv`.
+- Sequence sampling can persist every generated record with `output_fasta`.
+- Scoring and sampling return at most `max_inline_sequences=100` records by
+  default while reporting the total count and whether the payload was truncated.
+- Training writes `training_history.json` and reports `converged`,
+  `stop_reason`, and `epochs_completed`.
+- Non-finite scientific metrics are returned as JSON `null`, never non-standard
+  `NaN` or infinity values.
 
 ## Design principles
 

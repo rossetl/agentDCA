@@ -16,6 +16,10 @@ Use the agentDCA MCP tools to perform reproducible DCA workflows.
 5. Use `predict_dca_contacts` with a bounded `top_k`; increase it only when the user needs more pairs.
 6. Treat `sample_dca_sequences` and especially `train_dca_model` as computationally expensive. Preserve user-specified seeds and runtime settings.
 7. Report all written output paths and the device selected by model metadata.
+8. For scoring or sampling more than 100 sequences, provide `output_csv` or
+   `output_fasta`; tool responses contain only a bounded inline preview.
+9. Treat `converged=false` as an incomplete fit even when training completed
+   successfully, and report the returned `stop_reason`.
 
 ## Interpretation
 
@@ -27,6 +31,7 @@ Use the agentDCA MCP tools to perform reproducible DCA workflows.
 ## Safety and reproducibility
 
 - Do not overwrite a user file unless the user explicitly selected that output path.
+- Keep `overwrite=false` unless the user explicitly authorized replacement.
 - Do not launch training without an explicit request and a specified output directory.
 - Prefer `device="auto"` unless the user requests a specific device.
 - Surface structured tool errors without hiding the failing path or incompatible sequence length.
