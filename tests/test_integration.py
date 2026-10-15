@@ -86,6 +86,8 @@ def test_full_workflow(workspace):
         },
     )
     params = folder / "model" / "params.dat.gz"
+    assert training["strategy"] == "ptt"  # the CLI default
+    assert (folder / "model" / "ptt.h5").exists()
     assert training["artifacts"]["params"] == str(params)
     assert training["stop_reason"]
     assert (folder / "model" / "training.json").exists()
@@ -135,7 +137,7 @@ def test_full_workflow(workspace):
         },
     )
     assert report["verdict"] in {"healthy", "needs_attention"}
-    assert report["training_kind"] == "pcd"
+    assert report["training_kind"] == "ptt"
     assert "final_pearson" in report["sampling"]
 
 
@@ -151,6 +153,7 @@ def test_background_training_runs_in_a_detached_worker(workspace, tmp_path, monk
             "n_chains": 64,
             "max_epochs": 3,
             "device": "cpu",
+            "ptt": False,
             "background": True,
         },
     )

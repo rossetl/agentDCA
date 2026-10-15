@@ -950,6 +950,21 @@ def split_dca_alignment(
 # Training
 
 
+def _training_strategy(
+    ptt: bool | None, *, model_type: str, resume: bool, warm_start: bool
+) -> tuple[bool, str]:
+    """PTT or PCD, with the reason, following the adabmDCA CLI's default of PTT."""
+    if resume:
+        return True, "ptt_resume continues a PTT archive"
+    if ptt is not None:
+        return ptt, "requested"
+    if model_type not in ("bmDCA", "eaDCA"):
+        return False, f"PTT supports bmDCA and eaDCA only, so {model_type} trains with PCD"
+    if warm_start:
+        return False, "PTT cannot start from initial parameters or chains, so the run uses PCD"
+    return True, "default"
+
+
 def _ptt_config(ptt: bool, ptt_options: dict[str, Any] | None):
     if not ptt:
         if ptt_options:
@@ -1032,7 +1047,7 @@ async def train_dca_model(
     checkpoint_interval: int | None = None,
     initial_params_path: str | None = None,
     initial_chains_path: str | None = None,
-    ptt: bool = False,
+    ptt: bool | None = None,
     ptt_options: dict[str, Any] | None = None,
     ptt_resume: str | None = None,
     seed: int = 0,
@@ -1047,11 +1062,16 @@ async def train_dca_model(
     Options left null use adabmDCA's defaults (which differ for PTT). Model types: bmDCA
     (dense), eaDCA (edge activation; target_density/activation_*), edDCA (decimation;
     target_density/decimation_rate), edgeDCA (sparse, PCD only).
-    - validation_path tracks held-out log-likelihood (from split_dca_alignment).
-    - ptt=true trains with Parallel Trajectory Tempering (bmDCA/eaDCA); ptt_options are
-      PTTConfig fields, e.g. {"validation_stop": true} to stop at the validation plateau.
-      ptt_resume continues from a ptt.h5 archive (writes into the same files).
-    - initial_params_path / initial_chains_path restart or fine-tune from a previous run.
+    - Strategy, as in the adabmDCA CLI: Parallel Trajectory Tempering (PTT) by default.
+      ptt=null picks PTT for bmDCA/eaDCA and PCD for edDCA/edgeDCA or when restarting from
+      initial_params_path/initial_chains_path (PTT supports neither). ptt=false forces
+      PCD: much faster, but nothing checks that its chains stay at equilibrium.
+    - validation_path tracks held-out log-likelihood (from split_dca_alignment); with PTT
+      the run then stops at the validation plateau unless ptt_options sets
+      {"validation_stop": false}.
+    - ptt_options are PTTConfig fields. ptt_resume continues from a ptt.h5 archive (writes
+      into the same files).
+    - initial_params_path / initial_chains_path restart or fine-tune from a PCD run.
     - background=true returns a job id immediately; follow it with get_dca_job.
     Writes <label>_params.dat.gz, history.csv, events.jsonl, chains, weights, a JSON summary
     (training.json) and, with PTT, ptt.h5.
@@ -1061,7 +1081,14 @@ async def train_dca_model(
 
     label = validated_label(label)
     data_path = _path(data_path)
-    use_ptt = ptt or ptt_resume is not None
+    use_ptt, strategy_reason = _training_strategy(
+        ptt,
+        model_type=model_type,
+        resume=ptt_resume is not None,
+        warm_start=initial_params_path is not None or initial_chains_path is not None,
+    )
+    if use_ptt and validation_path is not None:
+        ptt_options = {"validation_stop": True, **(ptt_options or {})}
     names = training_artifact_names(label, ptt=use_ptt)
     output = prepare_output_dir(
         output_dir,
@@ -1094,7 +1121,7 @@ async def train_dca_model(
         "output_dir": str(output),
         "model_type": model_type,
         "label": label,
-        "ptt": use_ptt,
+        "strategy": "ptt" if use_ptt else "pcd",
         **kwargs,
     }
 
@@ -1127,7 +1154,9 @@ async def train_dca_model(
         artifacts.update(
             {name: str(path) for name, path in result.save_bundle(output, label=label).items()}
         )
-        return _training_summary(result, label=label, artifacts=artifacts)
+        summary = _training_summary(result, label=label, artifacts=artifacts)
+        strategy = {"strategy": "ptt" if use_ptt else "pcd", "strategy_reason": strategy_reason}
+        return {**strategy, **summary}
 
     return await _dispatch(
         ctx,

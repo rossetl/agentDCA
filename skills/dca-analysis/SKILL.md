@@ -27,11 +27,12 @@ tools add and how to use them.
 | Generate sequences (MCMC, PTT, steered) | `sample_dca_sequences` |
 | Entropy | `estimate_dca_entropy` |
 
-Tool parameters mirror the adabmDCA Python API, not the CLI. Two consequences:
+Defaults:
 
-- `train_dca_model` trains with PCD unless `ptt=true`. For a model the user will rely on,
-  pass `ptt=true`, a `validation_path`, and `ptt_options={"validation_stop": true}` (the
-  CLI defaults). PCD is for a quick first look.
+- `train_dca_model` trains with PTT, like the CLI, and stops at the validation plateau
+  when a `validation_path` is given. It falls back to PCD for edDCA/edgeDCA and when
+  restarting from `initial_params_path`/`initial_chains_path`; the result's `strategy`
+  and `strategy_reason` say which ran. Pass `ptt=false` only for a quick first look.
 - `sample_dca_sequences` runs plain MCMC unless `ptt=true` with `model_path` set to the
   run's `ptt.h5` and a `reference_fasta`.
 

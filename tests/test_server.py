@@ -104,7 +104,13 @@ def _metadata():
     )
 
 
+class _FakePTTConfig(dict):
+    def __init__(self, **options):
+        super().__init__(options)
+
+
 def _fake_adabmdca(monkeypatch, **functions):
+    functions.setdefault("PTTConfig", _FakePTTConfig)
     monkeypatch.setitem(sys.modules, "adabmDCA", SimpleNamespace(**functions))
 
 
@@ -501,7 +507,8 @@ def test_training_reports_native_convergence_and_bounds_input_report(tmp_path, m
     assert received["label"] == "edgeDCA"
     assert received["max_epochs"] == 5
     assert "learning_rate" not in received  # unset options keep adabmDCA defaults
-    assert received["ptt"] is None
+    assert received["ptt"] == {}  # PTT by default, like the adabmDCA CLI
+    assert response["strategy"] == "ptt"
     assert response["converged"] is False
     assert response["stop_reason"] == "max_gradient_steps"
     assert response["final_metrics"]["LL_val"] is None
@@ -509,6 +516,40 @@ def test_training_reports_native_convergence_and_bounds_input_report(tmp_path, m
     assert response["artifacts"]["summary"].endswith("edgeDCA_training.json")
     assert "without converging" in response["warnings"][-1]
     json.dumps(response, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    ("options", "expected_ptt", "strategy"),
+    [
+        ({"validation_path": "test.fasta"}, {"validation_stop": True}, "ptt"),
+        (
+            {"validation_path": "test.fasta", "ptt_options": {"validation_stop": False}},
+            {"validation_stop": False},
+            "ptt",
+        ),
+        ({"model_type": "edDCA"}, None, "pcd"),
+        ({"initial_params_path": "params.dat.gz"}, None, "pcd"),
+        ({"ptt": False}, None, "pcd"),
+    ],
+)
+def test_training_strategy_follows_the_cli_defaults(
+    tmp_path, monkeypatch, options, expected_ptt, strategy
+):
+    received = {}
+
+    def fake_train_model(data_path, **kwargs):
+        received.update(kwargs)
+        return _training_result(tmp_path, converged=True)
+
+    _fake_adabmdca(monkeypatch, train_model=fake_train_model)
+
+    response = asyncio.run(
+        train_dca_model("a.fasta", str(tmp_path / "model"), alphabet="protein", **options)
+    )
+
+    assert received["ptt"] == expected_ptt
+    assert response["strategy"] == strategy
+    assert response["strategy_reason"]
 
 
 def test_training_refuses_existing_artifacts(tmp_path, monkeypatch):

@@ -27,7 +27,7 @@ alone cannot give:
 |---|---|
 | `preprocess_dca_alignment` | Convert Stockholm/FASTA and optionally filter insertions, gaps, duplicates and unknown tokens |
 | `split_dca_alignment` | Train/test split with limited homology (clustering or Cobalt) |
-| `train_dca_model` | Train bmDCA, eaDCA, edDCA or edgeDCA, with PCD or Parallel Trajectory Tempering (PTT); validation set, weights, restart and resume |
+| `train_dca_model` | Train bmDCA, eaDCA, edDCA or edgeDCA, with Parallel Trajectory Tempering (PTT, the default as in the CLI) or PCD; validation set, weights, restart and resume |
 | `reintegrate_dca_model` | Retrain with signed experimental feedback on tested sequences |
 | `plot_dca_training_history` | Plot every recorded training quantity from `history.csv`; returns the overview as an image |
 | `diagnose_dca_run` | Verdict and findings (F1-F8) for a training run, optionally with its sampling check |
