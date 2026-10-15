@@ -1,0 +1,29 @@
+{
+  "name": "agentdca",
+  "version": "0.2.0",
+  "description": "Agent tools for Direct Coupling Analysis with adabmDCA: preprocess and split alignments, train DCA models (including PTT), score sequences, predict contacts, scan mutations, sample with diagnostics or steering, and estimate entropy.",
+  "author": {
+    "name": "Lorenzo Rosset"
+  },
+  "homepage": "https://github.com/rossetl/agentDCA",
+  "repository": "https://github.com/rossetl/agentDCA",
+  "license": "Apache-2.0",
+  "keywords": ["bioinformatics", "dca", "proteins", "rna", "sequences", "mcp"],
+  "mcpServers": {
+    "agentdca": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--locked",
+        "--project",
+        "${CLAUDE_PLUGIN_ROOT}/pyproject.toml",
+        "agentdca-mcp"
+      ],
+      "env": {
+        "MPLCONFIGDIR": "/tmp/agentdca-matplotlib",
+        "UV_CACHE_DIR": "/tmp/agentdca-uv-cache"
+      },
+      "timeout": 3600000
+    }
+  }
+}

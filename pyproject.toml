@@ -4,13 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentdca"
-version = "0.1.2"
+version = "0.2.0"
 description = "MCP server and agent plugin for adabmDCA"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Lorenzo Rosset" }]
 dependencies = [
-  "adabmDCA @ git+https://github.com/spqb/adabmDCApy.git@agent-api",
+  "adabmDCA[cpu] @ git+https://github.com/spqb/adabmDCApy.git@develop",
+  "matplotlib>=3.8",
+  "anyio>=4.9",
   "mcp>=2,<3",
   "numpy>=1.24",
 ]
@@ -29,7 +31,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["integration: end-to-end runs against the real adabmDCA package"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# Copied verbatim from adabmDCApy by scripts/sync_adabmdca_skill.py.
+extend-exclude = ["skills/adabmdca"]
