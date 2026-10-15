@@ -1338,10 +1338,7 @@ def diagnose_dca_run(
     options (the dca-analysis skill maps them to this server's parameters). Works on a run
     that is still going. Same report as `adabmDCA diagnose`.
     """
-    try:
-        from adabmDCA.api.diagnostics import diagnose_run
-    except ImportError:  # adabmDCA before diagnose_run
-        from agentdca.diagnose import diagnose_run
+    from adabmDCA.api.diagnostics import diagnose_run
 
     if label is not None:
         label = validated_label(label)

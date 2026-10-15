@@ -21,13 +21,13 @@ from agentdca._common import (
     training_artifact_names,
     validated_label,
 )
-from agentdca.diagnose import diagnose_run
 from agentdca.jobs import JobStore, WorkerContext, progress_snapshot
 from agentdca.models import ModelCache
 from agentdca.server import (
     _hamming_potential,
     _top_contacts,
     compare_dca_contacts,
+    diagnose_dca_run,
     mcp,
     predict_dca_contacts,
     sample_dca_sequences,
@@ -664,86 +664,20 @@ def _write_ptt_run(directory, *, updates=60, lr_bias=0.01, kl=0.001, events=(), 
         (directory / "training.json").write_text(json.dumps({"data": summary}))
 
 
-def test_diagnose_healthy_ptt_run(tmp_path):
+def test_diagnose_dca_run_wraps_adabmdca(tmp_path):
     run = tmp_path / "run"
     summary = {"stop_reason": "validation_plateau", "converged": True, "warnings": []}
     _write_ptt_run(run, summary=summary)
 
-    report = diagnose_run(run)
+    report = diagnose_dca_run(str(run))
 
     assert report["verdict"] == "healthy"
     assert report["training_kind"] == "ptt"
-    assert report["training"]["updates"] == 59
     assert [finding["code"] for finding in report["findings"]] == ["unchecked_model"]
-
-
-def test_diagnose_flags_trapped_configurations_and_large_learning_rate(tmp_path):
-    run = tmp_path / "run"
-    failed_check = {
-        "event": "ptt_mixing",
-        "step": 40,
-        "status": "budget_exceeded",
-        "immobile": [{"replica": 2, "immobile": 61, "blocking": True}],
-    }
-    recoveries = [{"event": "ptt_recovery", "step": 40}] * 3
-    _write_ptt_run(
-        run,
-        lr_bias=1e-14,
-        kl=0.01,
-        events=[failed_check, *recoveries],
-        summary={"stop_reason": None, "converged": False},
-    )
-
-    report = diagnose_run(run)
-
-    assert report["verdict"] == "failed"
-    failures = {finding["code"]: finding.get("failure") for finding in report["findings"]}
-    assert failures["trapped_configurations"] == "F1"
-    assert failures["learning_rate_too_large"] == "F5"
-    assert report["training"]["blocking_immobile_configurations"] == 61
-
-
-def test_diagnose_compares_sampling_with_training(tmp_path):
-    run = tmp_path / "run"
-    _write_ptt_run(run, summary={"stop_reason": "validation_plateau", "converged": True})
-    sampling = tmp_path / "sampling.json"
-    sampling.write_text(
-        json.dumps(
-            {
-                "data": {
-                    "ptt_diagnostics": {
-                        "converged": True,
-                        "final_pearson": 0.70,
-                        "mixing": {"status": "converged", "trapped_fraction": 0.0},
-                    },
-                    "distance_comparison": {
-                        "summary": {"generated_to_natural": {"median": 0.3, "identical": 0.01}},
-                        "privet": {"n_flagged": 2, "n_memorized": 1},
-                    },
-                }
-            }
-        )
-    )
-
-    report = diagnose_run(run, sampling_json=sampling)
-
-    codes = {finding["code"] for finding in report["findings"]}
-    assert {"sampling_pearson_drop", "memorization"} <= codes
-    assert "unchecked_model" not in codes
-    assert report["sampling"]["pearson_drop"] == pytest.approx(0.095, abs=1e-3)
-    assert report["verdict"] == "needs_attention"
-
-
-def test_diagnose_reports_a_running_job_and_a_missing_run(tmp_path):
-    run = tmp_path / "run"
-    _write_ptt_run(run)
-    assert diagnose_run(run)["verdict"] == "running"
     (tmp_path / "labeled").mkdir()
     (tmp_path / "labeled" / "x_history.csv").write_text("step\n")
-    from adabmDCA.exceptions import InputLoadError
-
-    with pytest.raises(InputLoadError, match="pass the matching label"):
-        diagnose_run(tmp_path / "labeled")
+    with pytest.raises(ToolError, match="pass the matching label"):
+        diagnose_dca_run(str(tmp_path / "labeled"))
 
 
 def test_plugin_ships_the_adabmdca_skill_and_links_it():

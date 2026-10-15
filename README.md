@@ -19,8 +19,7 @@ cannot give:
   later session.
 - **A verdict on a run.** `diagnose_dca_run` turns a run's history, events, summary and
   sampling check into findings that name the failure and the fix. It wraps adabmDCA's
-  `diagnose_run` (the `adabmDCA diagnose` command), with a bundled copy for versions
-  without it.
+  `diagnose_run`, so it gives the same report as the `adabmDCA diagnose` command.
 - **Plots the agent can see.** Training curves, contact maps and sampling diagnostics come
   back as images.
 - **Structured results and warm models.** Bounded, JSON-safe results with explicit
@@ -216,7 +215,6 @@ scripts/sync_adabmdca_skill.py    Refresh skills/adabmdca from an adabmDCApy che
 src/agentdca/server.py            MCP tools
 src/agentdca/jobs.py              Foreground progress/cancellation, on-disk job registry
 src/agentdca/worker.py            Detached worker that runs a background job
-src/agentdca/diagnose.py          Fallback copy of adabmDCA's diagnose_run, for versions without it
 src/agentdca/models.py            In-memory model cache
 src/agentdca/_common.py           Output guards, alphabet detection, JSON safety, errors
 ```

@@ -17,7 +17,7 @@ resolution-markers = [
 [[package]]
 name = "adabmdca"
 version = "2.0.0"
-source = { git = "https://github.com/spqb/adabmDCApy.git?rev=develop#71c272bf06794fe921dfc23aec729ea565bedbdd" }
+source = { git = "https://github.com/spqb/adabmDCApy.git?rev=develop#9398b74b67ff42c032fb2d292395e23d1e631a16" }
 dependencies = [
     { name = "biopython" },
     { name = "h5py" },
