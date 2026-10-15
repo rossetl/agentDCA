@@ -33,8 +33,12 @@ Defaults:
   when a `validation_path` is given. It falls back to PCD for edDCA/edgeDCA and when
   restarting from `initial_params_path`/`initial_chains_path`; the result's `strategy`
   and `strategy_reason` say which ran. Pass `ptt=false` only for a quick first look.
-- `sample_dca_sequences` runs plain MCMC unless `ptt=true` with `model_path` set to the
-  run's `ptt.h5` and a `reference_fasta`.
+- Sample with PTT whenever the model has a PTT archive: if the run directory holds a
+  `ptt.h5` (or `<label>_ptt.h5`), call `sample_dca_sequences` with `ptt=true`,
+  `model_path` set to that archive and a `reference_fasta` (the training alignment).
+  PTT sampling mixes through the ladder built in training. Use plain MCMC (the tool's
+  default) only for a model without an archive, such as a PCD run or a bare
+  `params.dat.gz`, or when the user asks for it.
 
 `alphabet="auto"` (the default) detects the alphabet like the CLI.
 
@@ -62,7 +66,8 @@ Foreground calls also report progress and stop when the client cancels them.
    `failed`, `running`, `incomplete`) with findings. Each finding names the failure it
    points to (F1-F8 of adabmDCA's diagnostics guide) and the change to make. Report the
    verdict and the actions; do not restate every indicator.
-2. Sample the model with `reference_fasta` (training data), `test_fasta` (held-out),
+2. Sample the model (with PTT when it has a `ptt.h5`, see above) with `reference_fasta`
+   (training data), `test_fasta` (held-out),
    `collect_diagnostics=true` and an `output_dir`, then call `diagnose_dca_run` again with
    `sampling_json` set to the written `sampling.json`. This compares the sampled Pearson
    with training, the ladder health, nearest-neighbour distances and PRIVET memorization.
