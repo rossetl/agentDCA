@@ -5,7 +5,23 @@ Open-source agent plugin and MCP server for
 Codex.
 
 agentDCA exposes the high-level adabmDCA Python API as structured tools that an agent can
-discover and call, plus a `dca-analysis` skill that teaches the agent the workflows.
+discover and call, plus a `dca-analysis` skill that teaches the agent how to use them.
+
+adabmDCA ships its own `adabmdca` agent skill for agents with a shell, which covers the
+workflow, settings and interpretation through the CLI. agentDCA focuses on what a skill
+alone cannot give:
+
+- **Jobs that outlive the chat.** Long runs execute in their own process, keep going when
+  the chat or the MCP server ends, and can be listed, followed and cancelled from any
+  later session.
+- **A verdict on a run.** `diagnose_dca_run` turns a run's history, events, summary and
+  sampling check into findings that name the failure and the fix, following adabmDCA's
+  diagnostics guide.
+- **Plots the agent can see.** Training curves, contact maps and sampling diagnostics come
+  back as images.
+- **Structured results and warm models.** Bounded, JSON-safe results with explicit
+  metadata, and recently used models kept in memory between calls.
+- **Clients without a shell**, such as Claude Desktop.
 
 | Tool | What it does |
 |---|---|
@@ -13,15 +29,17 @@ discover and call, plus a `dca-analysis` skill that teaches the agent the workfl
 | `split_dca_alignment` | Train/test split with limited homology (clustering or Cobalt) |
 | `train_dca_model` | Train bmDCA, eaDCA, edDCA or edgeDCA, with PCD or Parallel Trajectory Tempering (PTT); validation set, weights, restart and resume |
 | `reintegrate_dca_model` | Retrain with signed experimental feedback on tested sequences |
-| `plot_dca_training_history` | Plot every recorded training quantity from `history.csv` |
+| `plot_dca_training_history` | Plot every recorded training quantity from `history.csv`; returns the overview as an image |
+| `diagnose_dca_run` | Verdict and findings (F1-F8) for a training run, optionally with its sampling check |
+| `show_dca_plots` | Return saved PNG figures as images |
 | `inspect_dca_model` | Model metadata for a parameter file or PTT archive |
 | `score_dca_sequences` | DCA energies, context-dependent entropy and local free energies |
 | `predict_dca_contacts` | Ranked APC-corrected contacts from a model or mean-field DCA; full matrix export |
-| `compare_dca_contacts` | Side-by-side mean-field/model contact heatmaps (shared or per-panel scale) |
+| `compare_dca_contacts` | Side-by-side mean-field/model contact heatmaps (shared or per-panel scale), returned as an image |
 | `scan_dca_mutations` | All single substitutions of a wild type, ranked; full CSV export |
-| `sample_dca_sequences` | MCMC or PTT sampling, diagnostics against data (Cij, PCA, distances, PRIVET), steered sampling |
+| `sample_dca_sequences` | MCMC or PTT sampling, diagnostics against data (Cij, PCA, distances, PRIVET) with plots returned as images, steered sampling |
 | `estimate_dca_entropy` | Entropy by thermodynamic integration or from a PTT archive |
-| `get_dca_job`, `list_dca_jobs`, `cancel_dca_job` | Follow and stop runs started with `background=true` |
+| `get_dca_job`, `list_dca_jobs`, `cancel_dca_job` | Follow, find and stop runs started with `background=true`, from any session |
 
 ## Requirements
 
@@ -99,16 +117,37 @@ Generate 2000 sequences from model/params.dat.gz, compare them with the training
 alignments, and tell me whether the model memorizes training sequences.
 
 Score every single mutant of this wild type and list the 20 most favorable substitutions.
+
+Is the run in model/ healthy? Sample it against the test set and tell me whether I can
+rely on it.
 ```
 
 ## Long runs
 
-Training, reintegration, PTT sampling and entropy estimation accept `background=true`. The
-tool then returns a `job_id` immediately; `get_dca_job(job_id, wait_seconds=...)` reports
-the latest progress (Pearson, density, stage) and the final result, and `cancel_dca_job`
-asks adabmDCA to stop at its next safe point. Jobs live as long as the MCP server process.
-In the foreground, the same runs send MCP progress notifications and stop when the client
-cancels the call.
+Training, reintegration, sampling and entropy estimation accept `background=true`. The
+tool then returns a `job_id` immediately and runs the call in a detached worker process
+(`python -m agentdca.worker`), so the run continues when the chat, the client or the MCP
+server stops.
+
+- `get_dca_job(job_id, wait_seconds=...)` reports the latest progress (stage, Pearson,
+  density) and, once finished, the full result.
+- `list_dca_jobs` finds jobs started in earlier sessions.
+- `cancel_dca_job` asks adabmDCA to stop at its next safe point and keep its checkpoint;
+  `force=true` terminates a worker that does not respond.
+- A worker that dies without recording a result (machine restart, out of memory) is
+  reported as `interrupted`, with its log.
+
+Each job is a directory with `spec.json`, `status.json` and `worker.log` under
+`$AGENTDCA_HOME/jobs` (default `~/.agentdca/jobs`). In the foreground, the same runs send
+MCP progress notifications and stop when the client cancels the call.
+
+## Model cache
+
+The server keeps recently loaded models (parameter files and PTT samplers) in memory, so
+repeated scoring, scans, contact maps and sampling on one model skip the reload. Entries
+are keyed by path, size and modification time, so a retrained model is picked up
+automatically. `AGENTDCA_MODEL_CACHE` sets the number of models kept (default 2; 0
+disables the cache).
 
 ## Output safety
 
@@ -169,7 +208,10 @@ match.
 .mcp.json                         MCP launch configuration (Codex, ${PLUGIN_ROOT})
 skills/dca-analysis/              Agent workflow and interpretation guidance
 src/agentdca/server.py            MCP tools
-src/agentdca/jobs.py              Background jobs, progress and cancellation
+src/agentdca/jobs.py              Foreground progress/cancellation, on-disk job registry
+src/agentdca/worker.py            Detached worker that runs a background job
+src/agentdca/diagnose.py          Run diagnosis (diagnose_dca_run)
+src/agentdca/models.py            In-memory model cache
 src/agentdca/_common.py           Output guards, alphabet detection, JSON safety, errors
 ```
 

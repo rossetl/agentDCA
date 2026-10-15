@@ -1,104 +1,97 @@
 ---
 name: dca-analysis
-description: Analyze biological sequence alignments and Direct Coupling Analysis (Potts / Boltzmann machine) models with agentDCA and adabmDCA 2.x. Use for alignment cleanup and train/test splits, DCA training (bmDCA, eaDCA, edDCA, edgeDCA, PTT), sequence scoring, contact prediction, mutation scans, sequence generation with diagnostics or steering, entropy estimation, and retraining with experimental feedback.
+description: Drive adabmDCA through the agentDCA MCP tools - train Potts/Boltzmann machine DCA models on protein, RNA or DNA alignments as background jobs that survive the chat, follow and diagnose runs, look at plots, score, scan mutations, predict contacts, sample and estimate entropy. Use when the agentDCA tools are available, especially without a shell or for long runs.
 ---
 
-# DCA analysis
+# DCA analysis with agentDCA
 
-Use the agentDCA MCP tools to run reproducible adabmDCA workflows. Every tool is a thin
-adapter: scientific behaviour and defaults come from adabmDCA.
+agentDCA exposes adabmDCA 2.x as MCP tools. The science (what to train, which settings,
+how to read the outputs) is the same as with the adabmDCA CLI and is covered by the
+**`adabmdca` skill** shipped with adabmDCA
+(https://github.com/spqb/adabmDCApy/tree/develop/skills/adabmdca). Read it, when
+available, for the workflow, settings and interpretation; this skill covers what the
+tools add and how to use them.
 
-## Tools at a glance
+## Tools
 
 | Goal | Tool |
 |---|---|
-| Convert Stockholm/FASTA, filter gaps/duplicates/insertions | `preprocess_dca_alignment` |
-| Train/test split with limited homology | `split_dca_alignment` |
-| Train a model | `train_dca_model` |
-| Retrain with experimental labels | `reintegrate_dca_model` |
-| Plot training curves | `plot_dca_training_history` |
+| Clean an alignment, split train/test | `preprocess_dca_alignment`, `split_dca_alignment` |
+| Train, retrain with experimental labels | `train_dca_model`, `reintegrate_dca_model` |
+| Follow, stop and list runs | `get_dca_job`, `list_dca_jobs`, `cancel_dca_job` |
+| Is the run healthy? | `diagnose_dca_run` |
+| Training curves, any saved figure | `plot_dca_training_history`, `show_dca_plots` |
 | Model metadata | `inspect_dca_model` |
-| Energies of sequences | `score_dca_sequences` |
-| Contacts (model or mean-field) | `predict_dca_contacts`, `compare_dca_contacts` |
-| Single-mutant scan | `scan_dca_mutations` |
+| Energies, mutation scan | `score_dca_sequences`, `scan_dca_mutations` |
+| Contacts | `predict_dca_contacts`, `compare_dca_contacts` |
 | Generate sequences (MCMC, PTT, steered) | `sample_dca_sequences` |
-| Model entropy | `estimate_dca_entropy` |
-| Follow long runs | `get_dca_job`, `list_dca_jobs`, `cancel_dca_job` |
+| Entropy | `estimate_dca_entropy` |
 
-## Standard workflow
+Tool parameters mirror the adabmDCA Python API, not the CLI. Two consequences:
 
-1. **Inspect inputs.** Check the alignment format, length and alphabet. `alphabet="auto"`
-   (the default) detects protein, RNA or DNA from the data or model file; pass an explicit
-   alphabet only when detection is ambiguous or a custom token string is needed.
-2. **Preprocess only on request.** Do not remove insertions, duplicates or gap-rich sequences
-   unless the user asks; every filter is off by default.
-3. **Split before training when generalisation matters.** `split_dca_alignment` writes
-   `<prefix>.train.fasta` and `<prefix>.test.fasta`. Pass the test set as `validation_path`
-   when training and as `test_fasta` when assessing samples.
-4. **Train.** Leave options unset to use adabmDCA defaults. Choose the model:
-   - `bmDCA`: dense couplings, the default.
-   - `eaDCA`: sparse, couplings activated progressively (`target_density`, `activation_*`).
-   - `edDCA`: sparse by decimating a dense model (`target_density`, `decimation_rate`).
-   - `edgeDCA`: sparse, PCD only (not with PTT).
-   - `ptt=true` (bmDCA or eaDCA) trains with Parallel Trajectory Tempering: slower per step,
-     but keeps chains equilibrated and yields a `ptt.h5` archive for exact-mixing sampling and
-     cheap entropy. `ptt_options` takes `PTTConfig` fields, e.g. `{"validation_stop": true}`
-     (needs `validation_path`) to stop at the validation log-likelihood plateau.
-   - Restart or fine-tune with `initial_params_path` / `initial_chains_path`; continue an
-     interrupted PTT run with `ptt_resume`.
-5. **Run long jobs in the background.** For anything beyond a few minutes pass
-   `background=true`, then poll `get_dca_job(job_id, wait_seconds=...)`. Report progress
-   (Pearson, density, stage) to the user and use `cancel_dca_job` if asked to stop; adabmDCA
-   stops at a safe point and keeps its checkpoint.
-6. **Check the fit.** Report `converged` and `stop_reason`; `converged=false` is an incomplete
-   fit even when the run finished. Use `plot_dca_training_history` on `history.csv`.
-7. **Analyse.** Score, predict contacts, scan mutations or sample from `params.dat.gz` (or
-   `<label>_params.dat.gz`).
-8. **Validate generated sequences.** Sample with `reference_fasta` (training data),
-   `test_fasta` (held-out data), `collect_diagnostics=true` and an `output_dir`. Report the
-   final Cij Pearson, nearest-neighbour distances (generated vs. held-out to training) and the
-   PRIVET overfitting check (`n_flagged` / `n_memorized`).
+- `train_dca_model` trains with PCD unless `ptt=true`. For a model the user will rely on,
+  pass `ptt=true`, a `validation_path`, and `ptt_options={"validation_stop": true}` (the
+  CLI defaults). PCD is for a quick first look.
+- `sample_dca_sequences` runs plain MCMC unless `ptt=true` with `model_path` set to the
+  run's `ptt.h5` and a `reference_fasta`.
 
-## Sampling modes
+`alphabet="auto"` (the default) detects the alphabet like the CLI.
 
-- Ordinary MCMC (default sampler `metropolized_gibbs`). Without a reference it runs exactly
-  `n_sweeps`; with `reference_fasta` it measures the mixing time and runs
-  `mixing_multiplier` mixing times.
-- PTT: `ptt=true`, `model_path` = the training `ptt.h5`, `reference_fasta` required. It ignores
-  `n_sweeps` and `beta`; report `ptt_mixing.status`.
-- Steered: `steering_target` (aligned sequence) pulls samples towards it with
-  `V = steering_strength * Hamming distance`; `steering_script="file.py:function"` loads a
-  user-written potential `V(sequences, s)`. Only use a script the user wrote or approved,
-  since it executes in the server. Report the effective sample size in `steering`.
+## Long runs are jobs that outlive the chat
 
-## Entropy
+1. Pass `background=true` to training, reintegration, sampling and entropy for anything
+   longer than a minute or two. The tool returns a `job_id` at once; the run executes in
+   its own process and keeps going if the chat, the client or the MCP server stops.
+2. Follow it with `get_dca_job(job_id, wait_seconds=60)`: status, the latest progress
+   (stage, Pearson, density, entropy) and, when finished, the full result. A later chat
+   finds it with `list_dca_jobs`.
+3. While it runs, `plot_dca_training_history` on its `history.csv` and `diagnose_dca_run`
+   on its output directory show how it is going.
+4. `cancel_dca_job` asks adabmDCA to stop at its next safe point and keep its checkpoint.
+   Resume with `initial_params_path`/`initial_chains_path`, or `ptt_resume` for PTT.
+5. Status `interrupted` means the worker died without a result (machine restart, out of
+   memory): read `worker_log` and resume from the checkpoint.
 
-- `method="ptt"` on a `ptt.h5` archive: cheap, uses the PTT bridges.
-- `method="thermodynamic_integration"` on any parameter file: needs `natural_alignment` and a
-  `target_alignment` whose first sequence is the integration target. Expensive; prefer
-  `background=true`.
+Foreground calls also report progress and stop when the client cancels them.
 
-## Interpretation
+## Check every model before relying on it
 
-- Lower DCA energy means higher probability under the fitted model, not universal fitness.
-- `local_free_energy = energy - local_lambda * cde_sum` corrects energies for local
-  sequence entropy; mention which quantity a ranking uses.
-- Negative mutation `delta_energy` means the mutant is more probable than the wild type.
-- Contact scores are APC-corrected Frobenius norms that rank residue pairs; they are not
-  calibrated probabilities. Positions are given zero- and one-based.
-- In `compare_dca_contacts`, keep `color_scale="shared"` for comparison; use
-  `"per_panel"` when one matrix has much smaller scores and looks flat.
+1. When training ends, call `diagnose_dca_run(run_dir, label=...)`. It reads the history,
+   events, summary and log, and returns a `verdict` (`healthy`, `needs_attention`,
+   `failed`, `running`, `incomplete`) with findings. Each finding names the failure it
+   points to (F1-F8 of adabmDCA's diagnostics guide) and the change to make. Report the
+   verdict and the actions; do not restate every indicator.
+2. Sample the model with `reference_fasta` (training data), `test_fasta` (held-out),
+   `collect_diagnostics=true` and an `output_dir`, then call `diagnose_dca_run` again with
+   `sampling_json` set to the written `sampling.json`. This compares the sampled Pearson
+   with training, the ladder health, nearest-neighbour distances and PRIVET memorization.
+3. Act on `error` and `warning` findings before using the model. A `failed` verdict with
+   F1 means restarting from scratch with more sweeps, not resuming.
 
-## Safety and reproducibility
+## Looking at results
 
-- Never overwrite: keep `overwrite=false` unless the user explicitly authorises replacement.
-  Use distinct `label`s so several runs can share an output directory.
-- Do not start training, reintegration or large sampling without an explicit request and an
-  output directory.
-- Preserve user-specified seeds and runtime settings; prefer `device="auto"`.
-- Report every written path, the device used, and the returned `config` for training runs.
-- For more than 100 sequences, write them to a file (`output_csv`, `output_fasta`,
-  `output_dir`); responses carry only a bounded preview and long lists come back as
-  `{count, preview}`.
-- Tool errors carry adabmDCA's error code, message and details; surface them verbatim with
-  the failing path or parameter.
+- `plot_dca_training_history`, `compare_dca_contacts` and `sample_dca_sequences` (with
+  diagnostics and `output_dir`) return their main figures as images, so you can read the
+  plots directly. Pass `return_image(s)=false` to save context.
+- `show_dca_plots(paths)` returns any saved PNG (for example the other diagnostic plots
+  listed in a sampling result's `artifacts`).
+- Describe what a plot shows in words for the user; they may not see the image.
+
+## Repeated analyses are cheap
+
+The server keeps the last loaded models in memory (`AGENTDCA_MODEL_CACHE`, default 2),
+keyed by file, size and modification time. Scoring, scanning, contacts and sampling on
+the same model reuse it; a retrained file is reloaded automatically.
+
+## Safety
+
+- Outputs are never replaced unless `overwrite=true`; use a new `output_dir` or `label`
+  per run, and only overwrite when the user asks.
+- Do not start training, reintegration or large sampling without a request and an output
+  directory.
+- Responses carry at most `max_inline_sequences` records; write complete results with
+  `output_csv`, `output_fasta` or `output_dir` and report the paths.
+- `steering_script` runs a Python file inside the server: only use one the user wrote or
+  approved.
+- Errors carry adabmDCA's code, message and details: report the message and the setting
+  it names; do not retry blindly.

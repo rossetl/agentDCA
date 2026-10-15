@@ -1,7 +1,6 @@
 import asyncio
 import json
 import sys
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +9,7 @@ import numpy as np
 import pytest
 import tomllib
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.mcpserver.utilities.types import Image
 
 from agentdca._common import (
     bounded,
@@ -21,12 +21,13 @@ from agentdca._common import (
     training_artifact_names,
     validated_label,
 )
-from agentdca.jobs import JobManager, progress_snapshot
+from agentdca.diagnose import diagnose_run
+from agentdca.jobs import JobStore, WorkerContext, progress_snapshot
+from agentdca.models import ModelCache
 from agentdca.server import (
     _hamming_potential,
     _top_contacts,
     compare_dca_contacts,
-    get_dca_job,
     mcp,
     predict_dca_contacts,
     sample_dca_sequences,
@@ -35,6 +36,21 @@ from agentdca.server import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+class _PassthroughModels:
+    """Stand-in for the model cache: hands the path to the (faked) adabmDCA functions."""
+
+    def model(self, path, **_):
+        return path
+
+    def ptt_sampler(self, path, **_):
+        return path
+
+
+@pytest.fixture(autouse=True)
+def _no_model_cache(monkeypatch):
+    monkeypatch.setattr("agentdca.server.MODELS", _PassthroughModels())
 
 
 def test_plugin_launch_uses_locked_adabmdca_develop_dependency():
@@ -204,32 +220,46 @@ def test_progress_snapshot_keeps_metrics_and_drops_none():
     }
 
 
-def test_job_manager_runs_and_cancels():
-    from adabmDCA.exceptions import OperationCancelledError
+def test_job_store_runs_a_detached_worker(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTDCA_HOME", str(tmp_path))
+    store = JobStore()
 
-    jobs = JobManager()
+    job = store.submit("test", "list_dca_jobs", {"limit": 1}, {"purpose": "test"})
+    assert job["status"] in {"starting", "running", "succeeded"}
+    finished = store.wait(job["job_id"], timeout=120)
 
-    def slow(progress, is_cancelled):
-        for step in range(500):
-            progress(SimpleNamespace(completed=step, total=500))
-            if is_cancelled():
-                raise OperationCancelledError("stopped")
-            time.sleep(0.01)
-        return {"done": True}
-
-    job = jobs.start("test", slow, {})
-    time.sleep(0.05)
-    jobs.cancel(job.id)
-    jobs.wait(job.id, timeout=5)
-    assert job.status == "cancelled"
-    assert job.progress["total"] == 500
-
-    quick = jobs.start("test", lambda progress, is_cancelled: {"value": 1}, {})
-    jobs.wait(quick.id, timeout=5)
-    assert quick.status == "succeeded"
-    assert quick.to_dict()["result"] == {"value": 1}
+    assert finished["status"] == "succeeded", Path(finished["worker_log"]).read_text()
+    assert "jobs" in finished["result"]
+    assert store.list(limit=5)[0]["job_id"] == job["job_id"]
+    assert "result" not in store.list(limit=5)[0]
     with pytest.raises(KeyError, match="Unknown job"):
-        jobs.get("missing")
+        store.get("missing")
+
+
+def test_job_store_marks_dead_workers_interrupted(tmp_path):
+    store = JobStore(tmp_path)
+    directory = tmp_path / "training-x"
+    directory.mkdir()
+    (directory / "spec.json").write_text(json.dumps({"tool": "train_dca_model"}))
+    (directory / "status.json").write_text(json.dumps({"status": "running", "pid": 2**22 + 7}))
+
+    job = store.get("training-x")
+
+    assert job["status"] == "interrupted"
+    assert "checkpoint" in job["error"]
+    assert store.cancel("training-x")["cancel_requested"] is False
+
+
+def test_worker_context_records_progress_and_cancellation(tmp_path):
+    context = WorkerContext(tmp_path)
+    context.update(status="running")
+    context.progress(SimpleNamespace(epoch=3, metrics={"Pearson": 0.4}))
+    status = json.loads((tmp_path / "status.json").read_text())
+
+    assert status["latest_progress"]["metrics"]["Pearson"] == 0.4
+    assert context.is_cancelled() is False
+    (tmp_path / "cancel").write_text("now")
+    assert context.is_cancelled() is True
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +432,7 @@ def test_compare_contacts_writes_side_by_side_plot(tmp_path, monkeypatch, color_
     _fake_adabmdca(monkeypatch, predict_contacts=fake_predict_contacts)
     output = tmp_path / "comparison.png"
 
-    response = compare_dca_contacts(
+    response, image = compare_dca_contacts(
         "params.dat",
         "alignment.fasta",
         str(output),
@@ -413,6 +443,9 @@ def test_compare_contacts_writes_side_by_side_plot(tmp_path, monkeypatch, color_
     )
 
     assert output.read_bytes().startswith(b"\x89PNG")
+    assert isinstance(image, Image)
+    assert image.to_image_content().mime_type == "image/png"
+    assert response["images_returned"] == [str(output)]
     assert response["color_scale"]["mode"] == color_scale
     same = response["color_scale"]["mean_field"] == response["color_scale"]["model"]
     assert same is (color_scale == "shared")
@@ -489,18 +522,27 @@ def test_training_refuses_existing_artifacts(tmp_path, monkeypatch):
         asyncio.run(train_dca_model("a.fasta", str(tmp_path / "model"), alphabet="protein"))
 
 
-def test_training_in_background_returns_job(tmp_path, monkeypatch):
-    _fake_adabmdca(
-        monkeypatch, train_model=lambda *a, **k: _training_result(tmp_path, converged=True)
-    )
+def test_training_in_background_submits_replayable_call(tmp_path, monkeypatch):
+    from agentdca import server
+
+    submitted = {}
+
+    def fake_submit(kind, tool, arguments, parameters):
+        submitted.update(kind=kind, tool=tool, arguments=arguments)
+        return {"job_id": "training-1", "status": "starting", "job_dir": str(tmp_path)}
+
+    _fake_adabmdca(monkeypatch, train_model=lambda *a, **k: pytest.fail("ran in foreground"))
+    monkeypatch.setattr(server.JOBS, "submit", fake_submit)
 
     started = asyncio.run(
         train_dca_model("a.fasta", str(tmp_path / "model"), alphabet="protein", background=True)
     )
-    report = get_dca_job(started["job_id"], wait_seconds=5)
 
-    assert report["status"] == "succeeded"
-    assert report["result"]["converged"] is True
+    assert started["job_id"] == "training-1"
+    assert submitted["tool"] == "train_dca_model"
+    assert submitted["arguments"]["data_path"] == "a.fasta"
+    assert "ctx" not in submitted["arguments"]
+    json.dumps(submitted["arguments"])
 
 
 def test_mcp_registers_all_public_tools():
@@ -522,6 +564,140 @@ def test_mcp_registers_all_public_tools():
         "get_dca_job",
         "list_dca_jobs",
         "cancel_dca_job",
+        "show_dca_plots",
+        "diagnose_dca_run",
     }
     for tool in tools:
         assert "ctx" not in tool.input_schema.get("properties", {})
+    image_tools = {
+        "compare_dca_contacts",
+        "sample_dca_sequences",
+        "plot_dca_training_history",
+        "show_dca_plots",
+    }
+    # Image content cannot go through structured output.
+    assert {tool.name for tool in tools if tool.output_schema is None} >= image_tools
+
+
+def test_model_cache_reuses_until_the_file_changes(tmp_path, monkeypatch):
+    loads = []
+
+    def fake_load(path, **options):
+        loads.append(path)
+        return object()
+
+    monkeypatch.setitem(sys.modules, "adabmDCA", SimpleNamespace(load_model=fake_load))
+    first, second = tmp_path / "a.dat", tmp_path / "b.dat"
+    first.write_text("x")
+    second.write_text("y")
+    cache = ModelCache(capacity=1)
+    options = {"alphabet": "protein", "device": "cpu", "dtype": "float32"}
+
+    model = cache.model(str(first), **options)
+    assert cache.model(str(first), **options) is model
+    assert cache.model(str(first), **{**options, "dtype": "float64"}) is not model
+    first.write_text("retrained")
+    assert cache.model(str(first), **options) is not model
+    cache.model(str(second), **options)
+    assert len(cache.info()["entries"]) == 1
+    assert len(loads) == 4
+
+    disabled = ModelCache(capacity=0)
+    assert disabled.model(str(second), **options) is not disabled.model(str(second), **options)
+
+
+def _write_ptt_run(directory, *, updates=60, lr_bias=0.01, kl=0.001, events=(), summary=None):
+    directory.mkdir()
+    header = "step,sweeps,time_s,pearson,slope,ll_train,acceptance_min,lr_bias,lr_coupling,kl,"
+    header += "lag_drift,lag_drift_tail,pearson_val,ll_val"
+    rows = [header]
+    for step in range(updates):
+        rows.append(
+            f"{step},{10 * step},{step},{0.5 + step / 200},1,-1.5,0.4,{lr_bias},0.01,{kl},"
+            f"0.01,0.02,{0.5 + step / 250},{-1.6 + step / 1000}"
+        )
+    (directory / "history.csv").write_text("\n".join(rows) + "\n")
+    lines = [{"event": "ptt_optimization", "step": 0}, *events]
+    (directory / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in lines))
+    if summary is not None:
+        (directory / "training.json").write_text(json.dumps({"data": summary}))
+
+
+def test_diagnose_healthy_ptt_run(tmp_path):
+    run = tmp_path / "run"
+    summary = {"stop_reason": "validation_plateau", "converged": True, "warnings": []}
+    _write_ptt_run(run, summary=summary)
+
+    report = diagnose_run(run)
+
+    assert report["verdict"] == "healthy"
+    assert report["training_kind"] == "ptt"
+    assert report["training"]["updates"] == 59
+    assert [finding["code"] for finding in report["findings"]] == ["unchecked_model"]
+
+
+def test_diagnose_flags_trapped_configurations_and_large_learning_rate(tmp_path):
+    run = tmp_path / "run"
+    failed_check = {
+        "event": "ptt_mixing",
+        "step": 40,
+        "status": "budget_exceeded",
+        "immobile": [{"replica": 2, "immobile": 61, "blocking": True}],
+    }
+    recoveries = [{"event": "ptt_recovery", "step": 40}] * 3
+    _write_ptt_run(
+        run,
+        lr_bias=1e-14,
+        kl=0.01,
+        events=[failed_check, *recoveries],
+        summary={"stop_reason": None, "converged": False},
+    )
+
+    report = diagnose_run(run)
+
+    assert report["verdict"] == "failed"
+    failures = {finding["code"]: finding.get("failure") for finding in report["findings"]}
+    assert failures["trapped_configurations"] == "F1"
+    assert failures["learning_rate_too_large"] == "F5"
+    assert report["training"]["blocking_immobile_configurations"] == 61
+
+
+def test_diagnose_compares_sampling_with_training(tmp_path):
+    run = tmp_path / "run"
+    _write_ptt_run(run, summary={"stop_reason": "validation_plateau", "converged": True})
+    sampling = tmp_path / "sampling.json"
+    sampling.write_text(
+        json.dumps(
+            {
+                "data": {
+                    "ptt_diagnostics": {
+                        "converged": True,
+                        "final_pearson": 0.70,
+                        "mixing": {"status": "converged", "trapped_fraction": 0.0},
+                    },
+                    "distance_comparison": {
+                        "summary": {"generated_to_natural": {"median": 0.3, "identical": 0.01}},
+                        "privet": {"n_flagged": 2, "n_memorized": 1},
+                    },
+                }
+            }
+        )
+    )
+
+    report = diagnose_run(run, sampling_json=sampling)
+
+    codes = {finding["code"] for finding in report["findings"]}
+    assert {"sampling_pearson_drop", "memorization"} <= codes
+    assert "unchecked_model" not in codes
+    assert report["sampling"]["pearson_drop"] == pytest.approx(0.095, abs=1e-3)
+    assert report["verdict"] == "needs_attention"
+
+
+def test_diagnose_reports_a_running_job_and_a_missing_run(tmp_path):
+    run = tmp_path / "run"
+    _write_ptt_run(run)
+    assert diagnose_run(run)["verdict"] == "running"
+    (tmp_path / "labeled").mkdir()
+    (tmp_path / "labeled" / "x_history.csv").write_text("step\n")
+    with pytest.raises(FileNotFoundError, match="pass the matching label"):
+        diagnose_run(tmp_path / "labeled")

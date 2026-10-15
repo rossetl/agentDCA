@@ -1,33 +1,46 @@
-"""Foreground and background execution of long adabmDCA runs.
+"""Foreground runs, and background jobs that outlive the MCP server and the chat.
 
-Long operations (training, reintegration, PTT sampling, entropy) receive two hooks
-from adabmDCA: a ``progress`` callback and an ``is_cancelled`` predicate. In the
-foreground they drive MCP progress notifications and request cancellation; in the
-background they feed an in-memory job record that ``get_dca_job`` reports.
+Long operations (training, reintegration, sampling, entropy) receive two hooks from
+adabmDCA: a ``progress`` callback and an ``is_cancelled`` predicate.
+
+- In the foreground they drive MCP progress notifications and client cancellation.
+- In the background the tool call is written to a job directory and executed by a
+  detached worker process (``python -m agentdca.worker <job dir>``). The worker records
+  progress and the final result in ``status.json`` and stops when a ``cancel`` file
+  appears, so a job keeps running when the chat or the MCP server ends, and any later
+  session can list it, read its result or cancel it.
+
+Jobs live in ``$AGENTDCA_HOME/jobs`` (default ``~/.agentdca/jobs``).
 """
 
 from __future__ import annotations
 
-import itertools
+import json
+import os
+import secrets
+import signal
+import subprocess
+import sys
 import threading
 import time
-import traceback
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import anyio
 import anyio.from_thread
 import anyio.to_thread
 
-from agentdca._common import describe_error, json_safe
+from agentdca._common import json_safe
 
 Progress = Callable[[Any], None]
 IsCancelled = Callable[[], bool]
 Work = Callable[[Progress, IsCancelled], dict[str, Any]]
 
 PROGRESS_INTERVAL_SECONDS = 1.0
+STATUS_INTERVAL_SECONDS = 2.0
+TERMINAL_STATES = {"succeeded", "failed", "cancelled", "interrupted"}
 
 
 def progress_snapshot(event: Any) -> dict[str, Any]:
@@ -69,8 +82,83 @@ def _progress_numbers(snapshot: dict[str, Any]) -> tuple[float, float | None, st
     return progress, None if total is None else float(total), " ".join(parts)
 
 
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(json_safe(payload), indent=2, allow_nan=False) + "\n")
+    temporary.replace(path)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    for _ in range(5):
+        try:
+            return json.loads(path.read_text())
+        except json.JSONDecodeError:  # concurrent replace on some filesystems
+            time.sleep(0.05)
+    return json.loads(path.read_text())
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Worker-side state
+
+
+class WorkerContext:
+    """Hooks used when a tool runs inside ``agentdca.worker``."""
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.status_path = directory / "status.json"
+        self.cancel_path = directory / "cancel"
+        self._last_write = 0.0
+        self._events = 0
+
+    def update(self, **fields: Any) -> None:
+        status = _read_json(self.status_path) if self.status_path.exists() else {}
+        status.update(fields)
+        _write_json(self.status_path, status)
+
+    def progress(self, event: Any) -> None:
+        self._events += 1
+        now = time.monotonic()
+        if now - self._last_write < STATUS_INTERVAL_SECONDS:
+            return
+        self._last_write = now
+        self.update(
+            latest_progress=progress_snapshot(event),
+            progress_events=self._events,
+            updated_at=_now(),
+        )
+
+    def is_cancelled(self) -> bool:
+        return self.cancel_path.exists()
+
+
+WORKER: WorkerContext | None = None
+
+
 async def run_foreground(ctx: Any, work: Work) -> dict[str, Any]:
-    """Run blocking ``work`` in a worker thread, forwarding progress and cancellation."""
+    """Run blocking ``work`` in a thread, forwarding progress and cancellation.
+
+    Inside a background worker the job directory provides the hooks instead.
+    """
+    if WORKER is not None:
+        return work(WORKER.progress, WORKER.is_cancelled)
+
     cancel = threading.Event()
     last_sent = [0.0]
 
@@ -96,107 +184,146 @@ async def run_foreground(ctx: Any, work: Work) -> dict[str, Any]:
         raise
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+# ---------------------------------------------------------------------------
+# Job registry
 
 
-@dataclass
-class Job:
-    id: str
-    kind: str
-    parameters: dict[str, Any]
-    status: str = "running"
-    started_at: str = field(default_factory=_now)
-    finished_at: str | None = None
-    progress: dict[str, Any] | None = None
-    progress_events: int = 0
-    result: dict[str, Any] | None = None
-    error: str | None = None
-    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
-    thread: threading.Thread | None = field(default=None, repr=False)
+def jobs_home() -> Path:
+    root = os.environ.get("AGENTDCA_HOME") or str(Path.home() / ".agentdca")
+    path = Path(root).expanduser() / "jobs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
-    def to_dict(self, *, include_result: bool = True) -> dict[str, Any]:
-        document = {
-            "job_id": self.id,
-            "kind": self.kind,
-            "status": self.status,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "parameters": self.parameters,
-            "latest_progress": self.progress,
-            "progress_events": self.progress_events,
-            "cancel_requested": self.cancel_event.is_set(),
+
+class JobStore:
+    """Background jobs as directories: ``spec.json``, ``status.json``, ``worker.log``."""
+
+    def __init__(self, root: Path | None = None) -> None:
+        self._root = root
+
+    @property
+    def root(self) -> Path:
+        if self._root is not None:
+            self._root.mkdir(parents=True, exist_ok=True)
+            return self._root
+        return jobs_home()
+
+    def _directory(self, job_id: str) -> Path:
+        if not job_id or Path(job_id).name != job_id:
+            raise KeyError(f"Invalid job id '{job_id}'.")
+        directory = self.root / job_id
+        if not (directory / "spec.json").exists():
+            known = ", ".join(job["job_id"] for job in self.list(limit=10)) or "none"
+            raise KeyError(f"Unknown job '{job_id}'. Recent jobs: {known}.")
+        return directory
+
+    def submit(
+        self,
+        kind: str,
+        tool: str,
+        arguments: dict[str, Any],
+        parameters: dict[str, Any],
+    ) -> dict[str, Any]:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        job_id = f"{kind}-{stamp}-{secrets.token_hex(3)}"
+        directory = self.root / job_id
+        directory.mkdir(parents=True)
+        _write_json(
+            directory / "spec.json",
+            {"job_id": job_id, "kind": kind, "tool": tool, "arguments": arguments},
+        )
+        _write_json(
+            directory / "status.json",
+            {
+                "job_id": job_id,
+                "kind": kind,
+                "status": "starting",
+                "created_at": _now(),
+                "parameters": parameters,
+            },
+        )
+        log = (directory / "worker.log").open("ab")
+        kwargs: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": log,
+            "stderr": subprocess.STDOUT,
+            "cwd": str(directory),
+            "env": {**os.environ, "PYTHONUNBUFFERED": "1"},
         }
-        if self.error is not None:
-            document["error"] = self.error
-        if include_result and self.result is not None:
-            document["result"] = self.result
-        return document
+        if os.name == "nt":  # pragma: no cover - Windows
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008
+        else:
+            kwargs["start_new_session"] = True
+        # The worker records its own pid; only it writes status.json from here on.
+        process = subprocess.Popen(  # fixed interpreter and module
+            [sys.executable, "-m", "agentdca.worker", str(directory)], **kwargs
+        )
+        log.close()
+        # Reap the worker when it exits so a crashed one does not linger as a zombie
+        # that still looks alive to get().
+        threading.Thread(target=process.wait, daemon=True).start()
+        return self.get(job_id)
 
+    def get(self, job_id: str, *, include_result: bool = True) -> dict[str, Any]:
+        directory = self._directory(job_id)
+        status = _read_json(directory / "status.json")
+        state = status.get("status")
+        # A just-spawned worker gets a grace period to record its pid before it counts as lost.
+        starting = (
+            state == "starting" and time.time() - (directory / "spec.json").stat().st_mtime < 60
+        )
+        if state not in TERMINAL_STATES and not starting and not _pid_alive(status.get("pid")):
+            status["status"] = "interrupted"
+            status["error"] = (
+                "The worker process ended without recording a result; see worker_log. "
+                "Training runs can continue from their checkpoint with "
+                "initial_params_path/initial_chains_path or ptt_resume."
+            )
+            status.setdefault("finished_at", _now())
+            _write_json(directory / "status.json", status)
+        status["cancel_requested"] = (directory / "cancel").exists()
+        status["job_dir"] = str(directory)
+        status["worker_log"] = str(directory / "worker.log")
+        if not include_result:
+            status.pop("result", None)
+        return status
 
-class JobManager:
-    """In-process registry of background runs; jobs live as long as the server process."""
-
-    def __init__(self) -> None:
-        self._jobs: dict[str, Job] = {}
-        self._lock = threading.Lock()
-        self._ids = itertools.count(1)
-
-    def start(self, kind: str, work: Work, parameters: dict[str, Any]) -> Job:
-        with self._lock:
-            job_id = f"{kind}-{next(self._ids)}-{int(time.time())}"
-            job = Job(id=job_id, kind=kind, parameters=json_safe(parameters))
-            self._jobs[job_id] = job
-
-        def progress(event: Any) -> None:
-            job.progress = progress_snapshot(event)
-            job.progress_events += 1
-
-        def target() -> None:
+    def list(self, *, limit: int = 20, status: str | None = None) -> list[dict[str, Any]]:
+        entries = []
+        for directory in sorted(self.root.iterdir(), reverse=True):
+            if not (directory / "spec.json").exists():
+                continue
             try:
-                job.result = work(progress, job.cancel_event.is_set)
-                job.status = "succeeded"
-            except Exception as exc:  # noqa: BLE001 - every failure is recorded on the job
-                from adabmDCA.exceptions import OperationCancelledError
+                job = self.get(directory.name, include_result=False)
+            except (OSError, KeyError, json.JSONDecodeError):
+                continue
+            if status is None or job.get("status") == status:
+                entries.append(job)
+        entries.sort(key=lambda job: job.get("created_at", ""), reverse=True)
+        return entries[:limit]
 
-                if isinstance(exc, OperationCancelledError) or job.cancel_event.is_set():
-                    job.status = "cancelled"
-                    job.error = describe_error(exc)
-                else:
-                    job.status = "failed"
-                    job.error = describe_error(exc)
-                    job.parameters = {
-                        **job.parameters,
-                        "traceback_tail": traceback.format_exc().splitlines()[-6:],
-                    }
-            finally:
-                job.finished_at = _now()
+    def cancel(self, job_id: str) -> dict[str, Any]:
+        directory = self._directory(job_id)
+        job = self.get(job_id, include_result=False)
+        if job.get("status") not in TERMINAL_STATES:
+            (directory / "cancel").write_text(_now() + "\n")
+        return self.get(job_id, include_result=False)
 
-        job.thread = threading.Thread(target=target, name=f"agentdca-{job_id}", daemon=True)
-        job.thread.start()
+    def kill(self, job_id: str) -> dict[str, Any]:
+        """Terminate a worker that does not stop on cancel (last resort)."""
+        job = self.get(job_id, include_result=False)
+        pid = job.get("pid")
+        if job.get("status") not in TERMINAL_STATES and _pid_alive(pid):
+            os.kill(pid, signal.SIGTERM)
         return job
 
-    def get(self, job_id: str) -> Job:
-        try:
-            return self._jobs[job_id]
-        except KeyError:
-            known = ", ".join(sorted(self._jobs)) or "none"
-            raise KeyError(f"Unknown job '{job_id}'. Known jobs: {known}.") from None
-
-    def list(self) -> list[Job]:
-        return list(self._jobs.values())
-
-    def cancel(self, job_id: str) -> Job:
+    def wait(self, job_id: str, timeout: float) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
         job = self.get(job_id)
-        if job.status == "running":
-            job.cancel_event.set()
-        return job
-
-    def wait(self, job_id: str, timeout: float | None = None) -> Job:
-        job = self.get(job_id)
-        if job.thread is not None:
-            job.thread.join(timeout)
+        while job.get("status") not in TERMINAL_STATES and time.monotonic() < deadline:
+            time.sleep(min(1.0, max(0.05, deadline - time.monotonic())))
+            job = self.get(job_id)
         return job
 
 
-JOBS = JobManager()
+JOBS = JobStore()

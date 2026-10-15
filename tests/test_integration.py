@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from mcp import Client
 
+from agentdca.models import MODELS
 from agentdca.server import mcp
 
 pytestmark = pytest.mark.integration
@@ -30,15 +31,22 @@ def workspace(tmp_path_factory):
     return folder, alignment, "".join(LETTERS[base])
 
 
-def _call(name, arguments):
+def _call_raw(name, arguments):
     async def run():
         async with Client(mcp) as client:
             return await client.call_tool(name, arguments)
 
     result = asyncio.run(run())
-    text = result.content[0].text
-    assert not result.is_error, text
-    return json.loads(text)
+    assert not result.is_error, result.content[0].text
+    return result
+
+
+def _call(name, arguments):
+    return json.loads(_call_raw(name, arguments).content[0].text)
+
+
+def _images(result):
+    return [block for block in result.content if getattr(block, "type", None) == "image"]
 
 
 def _error(name, arguments):
@@ -85,6 +93,7 @@ def test_full_workflow(workspace):
     metadata = _call("inspect_dca_model", {"model_path": str(params)})
     assert metadata["alphabet"] == "protein" and metadata["length"] == 12
 
+    hits = MODELS.hits
     scores = _call("score_dca_sequences", {"model_path": str(params), "fasta_path": str(alignment)})
     assert scores["num_sequences"] > 0 and scores["cde_sum"]
 
@@ -93,8 +102,9 @@ def test_full_workflow(workspace):
 
     scan = _call("scan_dca_mutations", {"model_path": str(params), "wild_type": wild_type})
     assert scan["total_mutations"] == 12 * 19  # 19 non-gap substitutions per site
+    assert MODELS.hits > hits  # later calls reuse the model loaded by inspect
 
-    samples = _call(
+    sampled = _call_raw(
         "sample_dca_sequences",
         {
             "model_path": str(params),
@@ -106,10 +116,55 @@ def test_full_workflow(workspace):
             "device": "cpu",
         },
     )
+    samples = json.loads(sampled.content[0].text)
+    assert _images(sampled)
     assert samples["num_sequences"] == 32
     assert samples["artifacts"]["samples"].endswith("samples.fasta")
 
-    plots = _call(
+    plotted = _call_raw(
         "plot_dca_training_history", {"history_path": str(folder / "model" / "history.csv")}
     )
-    assert plots["plots"]["overview"].endswith("_overview.png")
+    assert json.loads(plotted.content[0].text)["plots"]["overview"].endswith("_overview.png")
+    assert len(_images(plotted)) == 1
+
+    report = _call(
+        "diagnose_dca_run",
+        {
+            "run_dir": str(folder / "model"),
+            "sampling_json": samples["artifacts"]["summary"],
+        },
+    )
+    assert report["verdict"] in {"healthy", "needs_attention"}
+    assert report["training_kind"] == "pcd"
+    assert "final_pearson" in report["sampling"]
+
+
+def test_background_training_runs_in_a_detached_worker(workspace, tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTDCA_HOME", str(tmp_path / "home"))
+    folder, alignment, _ = workspace
+    job = _call(
+        "train_dca_model",
+        {
+            "data_path": str(alignment),
+            "output_dir": str(folder / "background"),
+            "label": "bg",
+            "n_chains": 64,
+            "max_epochs": 3,
+            "device": "cpu",
+            "background": True,
+        },
+    )
+    assert job["status"] in {"starting", "running"}
+    assert job["job_dir"].startswith(str(tmp_path / "home"))
+
+    for _ in range(12):
+        finished = _call("get_dca_job", {"job_id": job["job_id"], "wait_seconds": 15})
+        if finished["status"] not in {"starting", "running"}:
+            break
+    assert finished["status"] == "succeeded", finished
+    assert finished["result"]["artifacts"]["params"].endswith("bg_params.dat.gz")
+    listed = _call("list_dca_jobs", {})
+    assert job["job_id"] in [entry["job_id"] for entry in listed["jobs"]]
+
+    report = _call("diagnose_dca_run", {"run_dir": str(folder / "background"), "label": "bg"})
+    assert report["verdict"] != "running"

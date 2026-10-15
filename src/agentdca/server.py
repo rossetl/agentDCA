@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import math
 from pathlib import Path
 from typing import Any, Literal
@@ -10,6 +11,7 @@ from typing import Any, Literal
 import numpy as np
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.utilities.types import Image
 
 from agentdca._common import (
     compact,
@@ -23,6 +25,7 @@ from agentdca._common import (
     validated_label,
 )
 from agentdca.jobs import JOBS, IsCancelled, Progress, run_foreground
+from agentdca.models import MODELS
 
 mcp = MCPServer(
     "agentDCA",
@@ -71,25 +74,66 @@ def _preview(values: Any, limit: int) -> list[Any]:
     return [json_safe(value) for value in list(values)[:limit]]
 
 
+def _call_arguments(values: dict[str, Any]) -> dict[str, Any]:
+    """The JSON arguments of a tool call, replayed by a background worker."""
+    return {key: value for key, value in values.items() if key != "ctx"}
+
+
 async def _dispatch(
     ctx: Context | None,
     *,
     kind: str,
+    tool: str,
+    arguments: dict[str, Any],
     background: bool,
     parameters: dict[str, Any],
     work: Any,
 ) -> dict[str, Any]:
     if background:
-        job = JOBS.start(kind, work, parameters)
+        job = JOBS.submit(kind, tool, arguments, parameters)
         return {
-            "job_id": job.id,
-            "status": job.status,
+            "job_id": job["job_id"],
+            "status": job["status"],
+            "job_dir": job["job_dir"],
             "message": (
-                f"{kind} started in the background. Poll get_dca_job('{job.id}') for "
-                "progress and the final result; cancel_dca_job stops it cleanly."
+                f"{kind} is running in a detached worker that survives this chat. Follow it "
+                f"with get_dca_job('{job['job_id']}') (also from later sessions) and stop it "
+                "with cancel_dca_job."
             ),
         }
     return await run_foreground(ctx, work)
+
+
+MAX_IMAGE_PIXELS = 1600
+
+
+def _image(path: str | Path) -> Image:
+    """A PNG of the plot, downscaled so its longest side is at most MAX_IMAGE_PIXELS."""
+    from PIL import Image as PILImage
+
+    with PILImage.open(path) as picture:
+        picture.thumbnail((MAX_IMAGE_PIXELS, MAX_IMAGE_PIXELS))
+        buffer = io.BytesIO()
+        picture.save(buffer, format="PNG", optimize=True)
+    return Image(data=buffer.getvalue(), format="png")
+
+
+def _with_images(
+    summary: dict[str, Any],
+    paths: list[str | Path],
+    *,
+    return_images: bool,
+    max_images: int,
+) -> dict[str, Any] | list[Any]:
+    """Attach plots as MCP image content, so the agent can look at them directly."""
+    from agentdca import jobs
+
+    selected = [Path(path) for path in paths if str(path).lower().endswith(".png")]
+    selected = [path for path in selected if path.is_file()][: max(max_images, 0)]
+    if not return_images or not selected or jobs.WORKER is not None:
+        return summary
+    summary = {**summary, "images_returned": [str(path) for path in selected]}
+    return [summary, *(_image(path) for path in selected)]
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +251,8 @@ def inspect_dca_model(
 
     model_path = _path(model_path)
     resolved = resolve_alphabet(alphabet, model=model_path)
-    metadata = inspect_model(model_path, alphabet=resolved, device=device, dtype=dtype)
+    model = MODELS.model(model_path, alphabet=resolved, device=device, dtype=dtype)
+    metadata = inspect_model(model)
     return _metadata_dict(metadata)
 
 
@@ -241,7 +286,7 @@ def score_dca_sequences(
     result = score_sequences(
         sequences=sequences,
         fasta_path=fasta_path,
-        model=model_path,
+        model=MODELS.model(model_path, alphabet=resolved, device=device, dtype=dtype),
         alphabet=resolved,
         device=device,
         dtype=dtype,
@@ -302,7 +347,9 @@ def predict_dca_contacts(
     model_path, fasta_path = _path(model_path), _path(fasta_path)
     resolved = resolve_alphabet(alphabet, model=model_path, data=fasta_path)
     result = predict_contacts(
-        model=model_path,
+        model=None
+        if model_path is None
+        else MODELS.model(model_path, alphabet=resolved, device=device, dtype=dtype),
         fasta_path=fasta_path,
         alphabet=resolved,
         pseudocount=pseudocount,
@@ -334,7 +381,7 @@ def predict_dca_contacts(
     )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)  # may return images
 @surface_errors
 def compare_dca_contacts(
     model_path: str,
@@ -349,12 +396,13 @@ def compare_dca_contacts(
     dtype: str = "float32",
     symmetrize: bool = True,
     overwrite: bool = False,
-) -> dict[str, Any]:
+    return_image: bool = True,
+) -> dict[str, Any] | list[Any]:
     """Plot mean-field and model contact matrices side by side and return ranked contacts.
 
     color_scale="shared" (default) makes the panels directly comparable; "per_panel" gives
     each panel its own 1st-99th percentile range, which helps when one model's scores are
-    much smaller.
+    much smaller. A .png plot is also returned as an image (return_image=false to skip).
     """
     from adabmDCA import predict_contacts
     from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -366,7 +414,9 @@ def compare_dca_contacts(
 
     model_path, fasta_path = _path(model_path), _path(fasta_path)
     resolved = resolve_alphabet(alphabet, model=model_path, data=fasta_path)
-    model_result = predict_contacts(model=model_path, alphabet=resolved, device=device, dtype=dtype)
+    model_result = predict_contacts(
+        model=MODELS.model(model_path, alphabet=resolved, device=device, dtype=dtype)
+    )
     mean_field_result = predict_contacts(
         fasta_path=fasta_path,
         alphabet=resolved,
@@ -413,7 +463,7 @@ def compare_dca_contacts(
     def scale(index: int) -> dict[str, Any]:
         return {"vmin": limits[index][0], "vmax": limits[index][1], "percentiles": [1, 99]}
 
-    return json_safe(
+    summary = json_safe(
         {
             "output_plot": str(plot_output),
             "sequence_length": int(model_scores.shape[0]),
@@ -445,6 +495,7 @@ def compare_dca_contacts(
             },
         }
     )
+    return _with_images(summary, [plot_output], return_images=return_image, max_images=1)
 
 
 @mcp.tool()
@@ -474,7 +525,7 @@ def scan_dca_mutations(
     resolved = resolve_alphabet(alphabet, model=model_path)
     result = scan_mutations(
         wild_type,
-        model=model_path,
+        model=MODELS.model(model_path, alphabet=resolved, device=device, dtype=dtype),
         alphabet=resolved,
         include_gap=include_gap,
         device=device,
@@ -553,6 +604,22 @@ def _load_steering_script(spec: str):
         raise AttributeError(f"Steering script '{path}' defines no '{function_name}'.") from None
 
 
+SAMPLING_PLOT_ORDER = (
+    "cij_scatter_plot",
+    "pca_1_2_plot",
+    "distances_plot",
+    "privet_plot",
+    "ptt_mixing_plot",
+    "data_vs_samples_plot",
+    "energy_cde_plot",
+    "pearson_plot",
+    "ptt_ladder_health_plot",
+    "ptt_renewal_plot",
+    "autocorrelation_plot",
+    "pca_3_4_plot",
+)
+
+
 def _sampling_summary(
     result: Any,
     *,
@@ -595,7 +662,7 @@ def _sampling_summary(
     return compact(summary, max_items=max(returned, 20))
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)  # may return images
 @surface_errors
 async def sample_dca_sequences(
     model_path: str,
@@ -628,9 +695,11 @@ async def sample_dca_sequences(
     output_fasta: str | None = None,
     overwrite: bool = False,
     max_inline_sequences: int = 100,
+    return_images: bool = True,
+    max_images: int = 4,
     background: bool = False,
     ctx: Context | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | list[Any]:
     """Generate sequences from a DCA model, optionally with diagnostics, PTT or steering.
 
     - Ordinary MCMC: runs n_sweeps sweeps; with reference_fasta it first measures the mixing
@@ -646,7 +715,10 @@ async def sample_dca_sequences(
       unsteered model. steering_script executes that Python file in this server.
     - output_dir writes the package bundle (samples FASTA/CSV, JSON summary, logs);
       output_fasta writes only a FASTA.
+    - With diagnostics and output_dir, up to max_images plots (Cij scatter, PCA, distances,
+      PRIVET, PTT mixing) are returned as images for direct inspection.
     """
+    call_arguments = _call_arguments(locals())
     from adabmDCA import sample_sequences
 
     limit = inline_limit(max_inline_sequences)
@@ -698,8 +770,14 @@ async def sample_dca_sequences(
         kwargs: dict[str, Any] = {}
         if potential is not None:
             kwargs.update(steering_potential=potential, steering_strength=steering_strength)
+        if ptt:
+            source = MODELS.ptt_sampler(model_path, device=device)
+        else:
+            # adabmDCA keeps bfloat16 models in float32 and casts only the sampler.
+            model_dtype = "float32" if dtype in (None, "bfloat16") else dtype
+            source = MODELS.model(model_path, alphabet=resolved, device=device, dtype=model_dtype)
         result = sample_sequences(
-            model=model_path,
+            model=source,
             n_sequences=n_sequences,
             ptt=ptt,
             ptt_local_sweeps=ptt_local_sweeps,
@@ -735,9 +813,20 @@ async def sample_dca_sequences(
             artifacts["output_fasta"] = result.to_fasta(fasta_output)
         return _sampling_summary(result, limit=limit, artifacts=json_safe(artifacts))
 
-    return await _dispatch(
-        ctx, kind="sampling", background=background, parameters=parameters, work=work
+    summary = await _dispatch(
+        ctx,
+        kind="sampling",
+        tool="sample_dca_sequences",
+        arguments=call_arguments,
+        background=background,
+        parameters=parameters,
+        work=work,
     )
+    if background:
+        return summary
+    artifacts = summary.get("artifacts") or {}
+    plots = [artifacts[key] for key in SAMPLING_PLOT_ORDER if key in artifacts]
+    return _with_images(summary, plots, return_images=return_images, max_images=max_images)
 
 
 # ---------------------------------------------------------------------------
@@ -967,6 +1056,7 @@ async def train_dca_model(
     Writes <label>_params.dat.gz, history.csv, events.jsonl, chains, weights, a JSON summary
     (training.json) and, with PTT, ptt.h5.
     """
+    call_arguments = _call_arguments(locals())
     from adabmDCA import train_model
 
     label = validated_label(label)
@@ -1040,7 +1130,13 @@ async def train_dca_model(
         return _training_summary(result, label=label, artifacts=artifacts)
 
     return await _dispatch(
-        ctx, kind="training", background=background, parameters=parameters, work=work
+        ctx,
+        kind="training",
+        tool="train_dca_model",
+        arguments=call_arguments,
+        background=background,
+        parameters=parameters,
+        work=work,
     )
 
 
@@ -1079,6 +1175,7 @@ async def reintegrate_dca_model(
     e.g. +1 functional and -1 non-functional. lambda_value weighs the experimental data
     (default 1/max|adjustment|). Files are labelled '<label>-lambda_<value>'.
     """
+    call_arguments = _call_arguments(locals())
     from adabmDCA import TrainingConfig, reintegrate_model
 
     label = validated_label(label) or "reintegrated"
@@ -1149,21 +1246,29 @@ async def reintegrate_dca_model(
         return summary
 
     return await _dispatch(
-        ctx, kind="reintegration", background=background, parameters=parameters, work=work
+        ctx,
+        kind="reintegration",
+        tool="reintegrate_dca_model",
+        arguments=call_arguments,
+        background=background,
+        parameters=parameters,
+        work=work,
     )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)  # may return images
 @surface_errors
 def plot_dca_training_history(
     history_path: str,
     output_dir: str | None = None,
-) -> dict[str, Any]:
+    return_image: bool = True,
+) -> dict[str, Any] | list[Any]:
     """Plot every recorded training quantity (Pearson, slope, log-likelihood, density, PTT ...).
 
     history_path is the run's history.csv (or <label>_history.csv). Writes one PNG per panel
     plus <label>_overview.png, by default in <label>_plots next to the history file.
-    Also returns the last recorded row.
+    Also returns the last recorded row and, unless return_image=false, the overview plot as
+    an image. Works on a run that is still training (e.g. a background job).
     """
     from adabmDCA.plot_training_log import plot_training_history, read_training_history
 
@@ -1171,7 +1276,7 @@ def plot_dca_training_history(
     written = plot_training_history(history_path, output_dir=_path(output_dir))
     history, context = read_training_history(history_path)
     last = history.iloc[-1].to_dict() if not history.empty else {}
-    return compact(
+    summary = compact(
         {
             "plots": written,
             "updates": len(history),
@@ -1182,6 +1287,32 @@ def plot_dca_training_history(
         },
         max_items=40,
     )
+    overview = [written["overview"]] if "overview" in written else []
+    return _with_images(summary, overview, return_images=return_image, max_images=1)
+
+
+@mcp.tool()
+@surface_errors
+def diagnose_dca_run(
+    run_dir: str,
+    label: str | None = None,
+    sampling_json: str | None = None,
+) -> dict[str, Any]:
+    """Diagnose a training run from its files: verdict, findings and the indicators behind them.
+
+    Reads <label_>history.csv, <label_>events.jsonl, <label_>training.json and the log in
+    run_dir, and optionally the sampling.json written by sample_dca_sequences (with
+    reference_fasta, test_fasta and collect_diagnostics) to check the finished model.
+    verdict is healthy, needs_attention, failed, running or incomplete (stopped without a
+    summary, e.g. cancelled). Each finding has a severity,
+    the failure it points to (F1-F8 of adabmDCA's diagnostics guide) and the recommended
+    change. Works on a run that is still going.
+    """
+    from agentdca.diagnose import diagnose_run
+
+    if label is not None:
+        label = validated_label(label)
+    return json_safe(diagnose_run(_path(run_dir), label=label, sampling_json=_path(sampling_json)))
 
 
 # ---------------------------------------------------------------------------
@@ -1217,6 +1348,7 @@ async def estimate_dca_entropy(
       target_alignment whose first sequence is the integration target.
     - "ptt": a PTT archive (ptt.h5); cheap, uses the stored PTT bridges (n_sweeps sweeps).
     """
+    call_arguments = _call_arguments(locals())
     label = validated_label(label) or "entropy"
     model_path = _path(model_path)
     folder = None
@@ -1287,7 +1419,13 @@ async def estimate_dca_entropy(
             )
 
     return await _dispatch(
-        ctx, kind="entropy", background=background, parameters=parameters, work=work
+        ctx,
+        kind="entropy",
+        tool="estimate_dca_entropy",
+        arguments=call_arguments,
+        background=background,
+        parameters=parameters,
+        work=work,
     )
 
 
@@ -1300,29 +1438,62 @@ async def estimate_dca_entropy(
 def get_dca_job(job_id: str, wait_seconds: float = 0.0) -> dict[str, Any]:
     """Report a background job: status, latest progress and, when finished, its result.
 
-    wait_seconds (max 300) blocks until the job finishes or the time elapses.
+    Jobs persist on disk, so this works for jobs started in earlier chats. wait_seconds
+    (max 300) blocks until the job finishes or the time elapses. Status is one of starting,
+    running, succeeded, failed, cancelled or interrupted (worker died; see worker_log).
     """
     if wait_seconds < 0:
         raise ValueError("wait_seconds cannot be negative.")
     if wait_seconds:
-        job = JOBS.wait(job_id, timeout=min(wait_seconds, 300.0))
-    else:
-        job = JOBS.get(job_id)
-    return job.to_dict()
+        return JOBS.wait(job_id, timeout=min(wait_seconds, 300.0))
+    return JOBS.get(job_id)
 
 
 @mcp.tool()
 @surface_errors
-def list_dca_jobs() -> dict[str, Any]:
-    """List background jobs started by this server process (results omitted)."""
-    return {"jobs": [job.to_dict(include_result=False) for job in JOBS.list()]}
+def list_dca_jobs(
+    limit: int = 20,
+    status: Literal["starting", "running", "succeeded", "failed", "cancelled", "interrupted"]
+    | None = None,
+) -> dict[str, Any]:
+    """List background jobs, newest first, including those started in earlier chats."""
+    from agentdca.jobs import jobs_home
+
+    return {"jobs_home": str(jobs_home()), "jobs": JOBS.list(limit=limit, status=status)}
 
 
 @mcp.tool()
 @surface_errors
-def cancel_dca_job(job_id: str) -> dict[str, Any]:
-    """Ask a running background job to stop. adabmDCA stops at the next safe point."""
-    return JOBS.cancel(job_id).to_dict(include_result=False)
+def cancel_dca_job(job_id: str, force: bool = False) -> dict[str, Any]:
+    """Ask a background job to stop; adabmDCA stops at its next safe point.
+
+    force=true terminates the worker process immediately (use only if cancel is ignored).
+    """
+    if force:
+        return JOBS.kill(job_id)
+    return JOBS.cancel(job_id)
+
+
+@mcp.tool(structured_output=False)  # may return images
+@surface_errors
+def show_dca_plots(paths: list[str], max_images: int = 4) -> list[Any]:
+    """Return existing PNG plots as images so they can be inspected directly.
+
+    Use it for plots written by background jobs or earlier runs (e.g. a job result's
+    artifacts, or plot_dca_training_history output).
+    """
+    resolved = [Path(path).expanduser() for path in paths]
+    missing = [str(path) for path in resolved if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Plot files not found: {', '.join(missing)}")
+    not_png = [str(path) for path in resolved if path.suffix.lower() != ".png"]
+    if not_png:
+        raise ValueError(f"Only PNG plots can be shown: {', '.join(not_png)}")
+    selected = resolved[: max(max_images, 0)]
+    return [
+        {"shown": [str(path) for path in selected], "skipped": len(resolved) - len(selected)},
+        *(_image(path) for path in selected),
+    ]
 
 
 def main() -> None:
