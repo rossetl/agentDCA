@@ -36,3 +36,5 @@ markers = ["integration: end-to-end runs against the real adabmDCA package"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# Copied verbatim from adabmDCApy by scripts/sync_adabmdca_skill.py.
+extend-exclude = ["skills/adabmdca"]

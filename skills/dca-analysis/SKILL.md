@@ -7,10 +7,12 @@ description: Drive adabmDCA through the agentDCA MCP tools - train Potts/Boltzma
 
 agentDCA exposes adabmDCA 2.x as MCP tools. The science (what to train, which settings,
 how to read the outputs) is the same as with the adabmDCA CLI and is covered by the
-**`adabmdca` skill** shipped with adabmDCA
-(https://github.com/spqb/adabmDCApy/tree/develop/skills/adabmdca). Read it, when
-available, for the workflow, settings and interpretation; this skill covers what the
-tools add and how to use them.
+**`adabmdca` skill**, which this plugin ships alongside this one
+([../adabmdca/SKILL.md](../adabmdca/SKILL.md), maintained in adabmDCApy). Read it for the
+workflow, settings, interpretation and diagnostics; it speaks in CLI options, so
+translate them with the table below. This skill covers what the tools add and how to use
+them. Where the two differ on how to run something, follow this skill: use the tools,
+not a shell.
 
 ## Tools
 
@@ -26,6 +28,39 @@ tools add and how to use them.
 | Contacts | `predict_dca_contacts`, `compare_dca_contacts` |
 | Generate sequences (MCMC, PTT, steered) | `sample_dca_sequences` |
 | Entropy | `estimate_dca_entropy` |
+
+## CLI options as tool parameters
+
+The `adabmdca` skill, the adabmDCA docs and `diagnose_dca_run` findings give advice as
+CLI options. Their tool equivalents:
+
+| CLI | Tool parameter |
+|---|---|
+| `train -d` / `-v` / `-o` / `-l` / `-w` | `train_dca_model(data_path, validation_path, output_dir, label, weights_path)` |
+| `-m` | `model_type` |
+| `--strategy ptt` / `pcd` | `ptt=true` / `false` (default: PTT, as in the CLI) |
+| `--lr`, `--nsweeps`, `--nchains`, `--sampler` | `learning_rate`, `n_sweeps`, `n_chains`, `sampler` |
+| `--target`, `--nepochs` | `target_pearson`, `max_epochs` |
+| `--max-gradient-steps`, `--max-structure-steps` | same names with underscores |
+| `--pseudocount`, `--l2_reg`, `--clustering_seqid`, `--no_reweighting` | `pseudocount`, `l2_regularization`, `clustering_seqid`, `no_reweighting` |
+| `--density`, `--drate`, `--gsteps`, `--factivate` | `target_density`, `decimation_rate`, `activation_steps`, `activation_fraction` |
+| `-p params.dat.gz -c chains.fasta` (restart PCD) | `initial_params_path`, `initial_chains_path` |
+| `--ptt-resume ptt.h5` | `ptt_resume` |
+| `--ptt-<name>` (e.g. `--ptt-target-acceptance 0.35`) | `ptt_options={"<name>": ...}` with underscores (`{"target_acceptance": 0.35}`) |
+| `--no-ptt-validation-stop` | `ptt_options={"validation_stop": false}` |
+| `sample -p` / `-d` / `-v` / `-o` / `--ngen` | `sample_dca_sequences(model_path, reference_fasta, test_fasta, output_dir, n_sequences)` |
+| `sample --plot` | `collect_diagnostics=true` (with `output_dir`, the plots are written and returned as images) |
+| `sample --strategy ptt` / `pcd` | `ptt=true` / `false` |
+| `--ptt-local-sweeps`, `--ptt-max-rounds`, `--ptt-stationary`, `--ptt-local-kernel`, `--ptt-return-full-ladder` | same names with underscores |
+| `--max_nsweeps`, `--nmix` (plain MCMC) | `n_sweeps`, `mixing_multiplier` |
+| `energies`, `dms`, `contacts` | `score_dca_sequences`, `scan_dca_mutations`, `predict_dca_contacts` |
+| `entropy` (`--strategy ptt` / `pcd`) | `estimate_dca_entropy(method="ptt" / "thermodynamic_integration")` |
+| `preprocess`, `split-data`, `reintegrate` | `preprocess_dca_alignment`, `split_dca_alignment`, `reintegrate_dca_model` |
+| `plot-training-log`, `diagnose` | `plot_dca_training_history`, `diagnose_dca_run` |
+| `--alphabet`, `--seed`, `--device`, `--dtype` | `alphabet` (default `auto`), `seed`, `device`, `dtype` |
+
+Running a CLI command in a shell instead would bypass the job registry, the output
+guards and the images, so use the tools when they are available.
 
 Defaults:
 

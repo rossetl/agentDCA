@@ -7,16 +7,20 @@ Codex.
 agentDCA exposes the high-level adabmDCA Python API as structured tools that an agent can
 discover and call, plus a `dca-analysis` skill that teaches the agent how to use them.
 
-adabmDCA ships its own `adabmdca` agent skill for agents with a shell, which covers the
-workflow, settings and interpretation through the CLI. agentDCA focuses on what a skill
-alone cannot give:
+adabmDCA maintains its own `adabmdca` agent skill, which covers the workflow, settings and
+interpretation through the CLI. The plugin ships a copy of it in `skills/adabmdca`, so
+clients without a shell get the same guidance; `dca-analysis` maps its CLI options to the
+tool parameters. Refresh the copy with `python scripts/sync_adabmdca_skill.py
+../adabmDCApy` (add `--check` to only compare). agentDCA focuses on what a skill alone
+cannot give:
 
 - **Jobs that outlive the chat.** Long runs execute in their own process, keep going when
   the chat or the MCP server ends, and can be listed, followed and cancelled from any
   later session.
 - **A verdict on a run.** `diagnose_dca_run` turns a run's history, events, summary and
-  sampling check into findings that name the failure and the fix, following adabmDCA's
-  diagnostics guide.
+  sampling check into findings that name the failure and the fix. It wraps adabmDCA's
+  `diagnose_run` (the `adabmDCA diagnose` command), with a bundled copy for versions
+  without it.
 - **Plots the agent can see.** Training curves, contact maps and sampling diagnostics come
   back as images.
 - **Structured results and warm models.** Bounded, JSON-safe results with explicit
@@ -206,11 +210,13 @@ match.
 .codex-plugin/plugin.json         Codex plugin manifest
 .agents/plugins/marketplace.json  Codex marketplace catalog
 .mcp.json                         MCP launch configuration (Codex, ${PLUGIN_ROOT})
-skills/dca-analysis/              Agent workflow and interpretation guidance
+skills/dca-analysis/              How to use the tools, with a CLI-option-to-parameter table
+skills/adabmdca/                  adabmDCA's own skill (workflow, settings, interpretation), copied
+scripts/sync_adabmdca_skill.py    Refresh skills/adabmdca from an adabmDCApy checkout
 src/agentdca/server.py            MCP tools
 src/agentdca/jobs.py              Foreground progress/cancellation, on-disk job registry
 src/agentdca/worker.py            Detached worker that runs a background job
-src/agentdca/diagnose.py          Run diagnosis (diagnose_dca_run)
+src/agentdca/diagnose.py          Fallback copy of adabmDCA's diagnose_run, for versions without it
 src/agentdca/models.py            In-memory model cache
 src/agentdca/_common.py           Output guards, alphabet detection, JSON safety, errors
 ```

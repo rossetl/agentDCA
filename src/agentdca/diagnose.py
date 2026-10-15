@@ -1,8 +1,15 @@
-"""Turn the files of a training run (and optionally a sampling check) into a verdict.
+"""Fallback copy of ``adabmDCA.api.diagnostics`` for adabmDCA versions without it.
 
-The rules follow adabmDCA's "Diagnose a run" guide (docs/algorithms/diagnostics.md):
-each finding names the failure it points to (F1-F8) and the change the guide recommends.
-Thresholds are the guide's; they are heuristics, so findings say what was measured.
+Kept identical to adabmDCA's module (apart from this docstring) so
+``diagnose_dca_run`` gives the same report either way. Delete this file once the locked
+adabmDCA version ships ``diagnose_run``.
+
+Turn the files of a training run (and optionally a sampling check) into a verdict.
+
+The rules follow the "Diagnose a run" guide (docs/algorithms/diagnostics.md): each
+finding names the failure it points to (F1-F8) and the change the guide recommends,
+written as CLI options. Thresholds are the guide's; they are heuristics, so findings say
+what was measured.
 """
 
 from __future__ import annotations
@@ -16,7 +23,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-GUIDE = "https://github.com/spqb/adabmDCApy/blob/develop/docs/algorithms/diagnostics.md"
+from adabmDCA.exceptions import InputLoadError
+
+GUIDE = "https://spqb.github.io/adabmDCApy/algorithms/diagnostics/"
 FAILURES = {
     "F1": "a narrow basin traps configurations",
     "F2": "the chains fall behind a forming mode",
@@ -200,7 +209,7 @@ def _check_training(
                 "running",
                 "No training summary yet and the run files changed recently: the run is "
                 f"probably still going (last event: {last or 'none'}).",
-                "Check again later, or follow the job with get_dca_job.",
+                "Check again later: tail history.csv and grep '»' in the log.",
             )
         elif ptt and (
             last in ("ptt_mixing", "ptt_recovery", "ptt_lag_pause", "ptt_equilibration")
@@ -212,7 +221,7 @@ def _check_training(
                 "No training summary and no output for a while; the last event was "
                 f"'{last}'. A run stuck in a mixing check or reservoir refresh is the "
                 "signature of a trapping basin. See log_tail for an error message.",
-                "Restart from scratch with 10x the local sweeps (nsweeps=100); do not "
+                "Restart from scratch with 10x the local sweeps (--nsweeps 100); do not "
                 "resume the archive.",
                 "F1",
             )
@@ -221,8 +230,8 @@ def _check_training(
                 "info",
                 "cancelled",
                 "The run was cancelled; its last checkpoint is in run_dir.",
-                "Resume from the checkpoint with initial_params_path/initial_chains_path, "
-                "or ptt_resume for PTT runs.",
+                "Resume from the checkpoint: --ptt-resume ptt.h5 for PTT runs, or -p "
+                "params.dat.gz -c chains.fasta for PCD runs.",
             )
         else:
             findings.add(
@@ -230,8 +239,8 @@ def _check_training(
                 "no_summary",
                 "No training summary and no recent output: the run ended without "
                 "saving one (crash, kill or error). See log_tail.",
-                "Resume from the checkpoint with initial_params_path/initial_chains_path, "
-                "or ptt_resume for PTT runs.",
+                "Resume from the checkpoint: --ptt-resume ptt.h5 for PTT runs, or -p "
+                "params.dat.gz -c chains.fasta for PCD runs.",
             )
         if any("Restart the training with more local sweeps" in line for line in log_tail):
             findings.add(
@@ -239,7 +248,7 @@ def _check_training(
                 "trapped_configurations",
                 "The run stopped after repeated mixing failures caused by configurations "
                 "that cannot swap toward the bottom of the ladder.",
-                "Restart from scratch with nsweeps=100. Do not resume.",
+                "Restart from scratch with --nsweeps 100. Do not resume.",
                 "F1",
             )
         return
@@ -250,8 +259,8 @@ def _check_training(
             "warning",
             "not_converged",
             f"The run ended on '{stop_reason}' before reaching its convergence criterion.",
-            "Continue from the saved parameters and chains (or ptt_resume) with a larger "
-            "budget, if the curves were still improving.",
+            "If the curves were still improving, continue with a larger budget "
+            "(--ptt-resume ptt.h5 for PTT runs, -p params.dat.gz -c chains.fasta for PCD).",
         )
     for warning in summary.get("warnings") or []:
         findings.add("info", "training_warning", str(warning))
@@ -264,7 +273,7 @@ def _check_training(
             "trapped_configurations",
             f"{failed} mixing check(s) failed with up to {blocking} configurations that "
             "cannot swap toward the bottom of the ladder.",
-            "Restart from scratch with nsweeps=100. Do not resume the archive.",
+            "Restart from scratch with --nsweeps 100. Do not resume the archive.",
             "F1",
         )
     elif failed:
@@ -274,7 +283,7 @@ def _check_training(
             f"{failed} mixing check(s) failed without blocking immobile configurations: "
             "a link too wide (F3) or replicas relaxing too slowly (F4). The failure "
             "messages in the log say which.",
-            "F3: a smaller lr or a larger ptt target acceptance. F4: more nsweeps.",
+            "F3: a smaller --lr or a larger --ptt-target-acceptance. F4: more --nsweeps.",
             "F3",
         )
     if indicators.get("recoveries"):
@@ -291,7 +300,7 @@ def _check_training(
             "repeated_pauses",
             f"{pauses} lag pause(s), {indicators.get('failed_pause_refreshes', 0)} with a "
             "failed reservoir refresh: the forming mode is too narrow for the lag estimate.",
-            "Treat as F1: restart with nsweeps=100.",
+            "Treat as F1: restart with --nsweeps 100.",
             "F1",
         )
     elif pauses:
@@ -308,7 +317,7 @@ def _check_training(
             "warning",
             "growing_reservoir_warmup",
             f"Reservoir refresh warmups grew {warmups}: an early warning of a trapping basin.",
-            "Watch for stalls; consider restarting with nsweeps=100.",
+            "Watch for stalls; consider restarting with --nsweeps 100.",
             "F1",
         )
     long_enough = (indicators.get("updates") or 0) >= MIN_UPDATES_FOR_RATES
@@ -322,7 +331,7 @@ def _check_training(
             f"lr_bias at its floor in {indicators.get('lr_bias_at_floor_fraction')} of the "
             f"updates, median kl {indicators.get('median_kl')} (cap 0.01): the trust region "
             "binds at every step.",
-            "Go back to the default lr=0.01.",
+            "Go back to the default --lr 0.01.",
             "F5",
         )
     if long_enough and (indicators.get("fraction_acceptance_below_0.1") or 0) > 0.1:
@@ -331,7 +340,7 @@ def _check_training(
             "low_acceptance",
             "The minimum swap acceptance stayed below 0.1 in "
             f"{indicators['fraction_acceptance_below_0.1']} of the updates.",
-            "Check for immobile configurations first (F1); otherwise a smaller lr or a "
+            "Check for immobile configurations first (F1); otherwise a smaller --lr or a "
             "larger ptt target acceptance.",
             "F3",
         )
@@ -351,7 +360,8 @@ def _check_training(
             "validation_falling",
             f"Validation log-likelihood fell from its best {best} to {final} per site "
             f"over the last {round((1 - position) * 100)}% of the run.",
-            "Use validation_stop, or keep the checkpoint near the best value; a falling "
+            "Keep the validation stop on (the default with -v), or use the checkpoint near "
+            "the best value; a falling "
             "curve can also follow a trapped mode (F1).",
         )
     if not ptt:
@@ -359,7 +369,7 @@ def _check_training(
             "info",
             "pcd_model",
             "PCD training metrics come from chains that may not be at equilibrium.",
-            "Resample the model with plain MCMC and reference_fasta: the Pearson should "
+            "Resample it with sample --strategy pcd -d train.fasta --plot: the Pearson should "
             "settle on a plateau and a mixing time should be found.",
             "PCD",
         )
@@ -386,7 +396,7 @@ def _check_sampling(
                 f"Independent samples reach Pearson {final:.3f} against {training_pearson:.3f} "
                 "reported by training. Compare at equal sample size; healthy runs lose "
                 "0.003-0.007.",
-                "Retrain with more nsweeps.",
+                "Retrain with more --nsweeps.",
                 "F6",
             )
     if ptt:
@@ -401,8 +411,8 @@ def _check_sampling(
                 "ptt_sampling_incomplete",
                 f"PTT sampling did not renew within its budget (status "
                 f"{mixing.get('status')}, trapped fraction {indicators.get('trapped_fraction')}).",
-                "If G was still decaying, raise ptt_max_rounds; otherwise retrain with more "
-                "nsweeps.",
+                "If G was still decaying, raise --ptt-max-rounds; otherwise retrain with more "
+                "--nsweeps.",
                 "F7",
             )
         pairs = (ptt.get("ladder_health") or {}).get("pairs") or []
@@ -415,7 +425,7 @@ def _check_sampling(
                     "trapped_links",
                     f"Up to {max(immobile):.1%} of a rung's configurations rarely swap down. "
                     "This does not mean bad samples, but a basin's share may be off.",
-                    "Compare cluster shares with and without ptt_stationary.",
+                    "Compare cluster shares with and without --ptt-stationary.",
                     "F6",
                 )
     elif len(pearsons) >= 6:
@@ -496,8 +506,9 @@ def diagnose_run(
     if not files["history"].exists() and not files["summary"].exists():
         candidates = sorted(path.name for path in run.glob("*history.csv"))
         hint = f" Found: {', '.join(candidates)}; pass the matching label." if candidates else ""
-        raise FileNotFoundError(
-            f"No {files['history'].name} or {files['summary'].name} in {run}.{hint}"
+        raise InputLoadError(
+            f"No {files['history'].name} or {files['summary'].name} in {run}.{hint}",
+            details={"run_dir": str(run), "label": label},
         )
 
     history = _read_history(files["history"]) if files["history"].exists() else {}
@@ -528,8 +539,8 @@ def diagnose_run(
             "info",
             "unchecked_model",
             "Training metrics alone cannot show a miscalibrated model.",
-            "Sample the model with reference_fasta, test_fasta and collect_diagnostics, "
-            "then pass its sampling.json here.",
+            "Sample it with sample -p ptt.h5 -d train.fasta -v test.fasta --plot -o check, "
+            "then diagnose again with that sampling.json.",
             "F6",
         )
 

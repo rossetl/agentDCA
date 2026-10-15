@@ -1333,11 +1333,15 @@ def diagnose_dca_run(
     run_dir, and optionally the sampling.json written by sample_dca_sequences (with
     reference_fasta, test_fasta and collect_diagnostics) to check the finished model.
     verdict is healthy, needs_attention, failed, running or incomplete (stopped without a
-    summary, e.g. cancelled). Each finding has a severity,
-    the failure it points to (F1-F8 of adabmDCA's diagnostics guide) and the recommended
-    change. Works on a run that is still going.
+    summary, e.g. cancelled). Each finding has a severity, the failure it points to (F1-F8
+    of adabmDCA's diagnostics guide) and the recommended change, written as adabmDCA CLI
+    options (the dca-analysis skill maps them to this server's parameters). Works on a run
+    that is still going. Same report as `adabmDCA diagnose`.
     """
-    from agentdca.diagnose import diagnose_run
+    try:
+        from adabmDCA.api.diagnostics import diagnose_run
+    except ImportError:  # adabmDCA before diagnose_run
+        from agentdca.diagnose import diagnose_run
 
     if label is not None:
         label = validated_label(label)

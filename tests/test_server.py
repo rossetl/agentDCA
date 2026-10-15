@@ -740,5 +740,44 @@ def test_diagnose_reports_a_running_job_and_a_missing_run(tmp_path):
     assert diagnose_run(run)["verdict"] == "running"
     (tmp_path / "labeled").mkdir()
     (tmp_path / "labeled" / "x_history.csv").write_text("step\n")
-    with pytest.raises(FileNotFoundError, match="pass the matching label"):
+    from adabmDCA.exceptions import InputLoadError
+
+    with pytest.raises(InputLoadError, match="pass the matching label"):
         diagnose_run(tmp_path / "labeled")
+
+
+def test_plugin_ships_the_adabmdca_skill_and_links_it():
+    bundled = PROJECT_ROOT / "skills" / "adabmdca" / "SKILL.md"
+    assert bundled.read_text().startswith("---\nname: adabmdca\n")
+    for reference in ("cli.md", "python-api.md", "outputs.md", "diagnostics.md"):
+        assert (bundled.parent / "references" / reference).is_file()
+    ours = (PROJECT_ROOT / "skills" / "dca-analysis" / "SKILL.md").read_text()
+    assert "](../adabmdca/SKILL.md)" in ours
+
+
+def test_cli_table_names_real_tools_and_parameters():
+    import re
+
+    tools = asyncio.run(mcp.list_tools())
+    known = {tool.name for tool in tools}
+    known |= {name for tool in tools for name in tool.input_schema.get("properties", {})}
+    skill = (PROJECT_ROOT / "skills" / "dca-analysis" / "SKILL.md").read_text()
+    table = skill.split("## CLI options as tool parameters", 1)[1].split("\n\n", 2)[2]
+    rows = [line for line in table.splitlines() if line.startswith("|")][2:]
+    named = set()
+    for row in rows:
+        right = row.split("|")[2]
+        for code in re.findall(r"`([^`]+)`", right):
+            named.update(re.findall(r"\b([a-z][a-z0-9]*_[a-z0-9_]+|[a-z]{3,})\b(?=[(,=)]|$)", code))
+    named -= {
+        "true",
+        "false",
+        "auto",
+        "ptt",
+        "thermodynamic_integration",
+        "target_acceptance",
+        "validation_stop",
+        "name",
+    }
+    assert named, "table not parsed"
+    assert named <= known, sorted(named - known)
