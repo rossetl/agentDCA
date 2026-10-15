@@ -1,0 +1,14 @@
+{
+  "name": "agentdca",
+  "description": "agentDCA: MCP tools and a skill for Direct Coupling Analysis with adabmDCA.",
+  "owner": {
+    "name": "Lorenzo Rosset"
+  },
+  "plugins": [
+    {
+      "name": "agentdca",
+      "source": ".",
+      "description": "Agent tools for Direct Coupling Analysis with adabmDCA."
+    }
+  ]
+}

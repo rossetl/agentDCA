@@ -1,6 +1,6 @@
 {
   "name": "agentdca",
-  "version": "0.1.2+codex.20260828125144",
+  "version": "0.2.0",
   "description": "Agent tools for Direct Coupling Analysis with adabmDCA.",
   "author": {
     "name": "Lorenzo Rosset"
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "agentDCA",
     "shortDescription": "Analyze sequence alignments and DCA models.",
-    "longDescription": "Use adabmDCA through structured agent tools for preprocessing alignments, training models, scoring sequences, predicting contacts, scanning mutations, and sampling sequences.",
+    "longDescription": "Use adabmDCA 2.x through structured agent tools: preprocess and split alignments, train DCA models (bmDCA, eaDCA, edDCA, edgeDCA, PTT), score sequences, predict contacts, scan mutations, sample with diagnostics or steering, estimate entropy, and retrain with experimental feedback.",
     "developerName": "Lorenzo Rosset",
     "category": "Developer Tools",
     "capabilities": [

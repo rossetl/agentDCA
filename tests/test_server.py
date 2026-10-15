@@ -1,19 +1,32 @@
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import adabmDCA.exceptions  # noqa: F401  (real exceptions stay importable under fakes)
 import numpy as np
 import pytest
 import tomllib
+from mcp.server.mcpserver.exceptions import ToolError
 
+from agentdca._common import (
+    bounded,
+    json_safe,
+    prepare_file_output,
+    prepare_output_dir,
+    resolve_alphabet,
+    surface_errors,
+    training_artifact_names,
+    validated_label,
+)
+from agentdca.jobs import JobManager, progress_snapshot
 from agentdca.server import (
-    _json_safe,
-    _prepare_file_output,
-    _prepare_training_output,
+    _hamming_potential,
     _top_contacts,
     compare_dca_contacts,
+    get_dca_job,
     mcp,
     predict_dca_contacts,
     sample_dca_sequences,
@@ -24,7 +37,7 @@ from agentdca.server import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_plugin_launch_uses_locked_adabmdca_agent_api_dependency():
+def test_plugin_launch_uses_locked_adabmdca_develop_dependency():
     mcp_config = json.loads((PROJECT_ROOT / ".mcp.json").read_text())
     server_config = mcp_config["mcpServers"]["agentdca"]
     args = server_config["args"]
@@ -32,16 +45,35 @@ def test_plugin_launch_uses_locked_adabmdca_agent_api_dependency():
     lock = tomllib.loads((PROJECT_ROOT / "uv.lock").read_text())
 
     assert (
-        "adabmDCA @ git+https://github.com/spqb/adabmDCApy.git@agent-api"
+        "adabmDCA[cpu] @ git+https://github.com/spqb/adabmDCApy.git@develop"
         in project["project"]["dependencies"]
     )
     assert args[:2] == ["run", "--locked"]
     assert "--upgrade-package" not in args
     adabmdca = next(package for package in lock["package"] if package["name"] == "adabmdca")
     assert adabmdca["source"]["git"].startswith(
-        "https://github.com/spqb/adabmDCApy.git?rev=agent-api#"
+        "https://github.com/spqb/adabmDCApy.git?rev=develop#"
     )
+    assert int(adabmdca["version"].split(".")[0]) >= 2
     assert server_config["env"]["MPLCONFIGDIR"] == "/tmp/agentdca-matplotlib"
+
+
+def test_plugin_manifests_share_version():
+    project = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())
+    version = project["project"]["version"]
+    codex = json.loads((PROJECT_ROOT / ".codex-plugin" / "plugin.json").read_text())
+    claude = json.loads((PROJECT_ROOT / ".claude-plugin" / "plugin.json").read_text())
+    assert codex["version"].split("+")[0] == version
+    assert claude["version"] == version
+    # Claude Code also loads the root .mcp.json (written for Codex's ${PLUGIN_ROOT});
+    # the same-named inline server replaces it with Claude Code's root variable.
+    codex_server = json.loads((PROJECT_ROOT / ".mcp.json").read_text())["mcpServers"]
+    claude_server = claude["mcpServers"]["agentdca"]
+    assert set(codex_server) == {"agentdca"}
+    assert "${CLAUDE_PLUGIN_ROOT}/pyproject.toml" in claude_server["args"]
+    assert claude_server["args"][:2] == codex_server["agentdca"]["args"][:2]
+    marketplace = json.loads((PROJECT_ROOT / ".claude-plugin" / "marketplace.json").read_text())
+    assert marketplace["plugins"][0]["name"] == claude["name"]
 
 
 def _metadata():
@@ -56,21 +88,20 @@ def _metadata():
     )
 
 
+def _fake_adabmdca(monkeypatch, **functions):
+    monkeypatch.setitem(sys.modules, "adabmDCA", SimpleNamespace(**functions))
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+
+
 def test_top_contacts_returns_ranked_upper_triangle():
-    scores = np.array(
-        [
-            [0.0, 0.2, 0.9],
-            [0.2, 0.0, 0.5],
-            [0.9, 0.5, 0.0],
-        ]
-    )
+    scores = np.array([[0.0, 0.2, 0.9], [0.2, 0.0, 0.5], [0.9, 0.5, 0.0]])
 
     contacts = _top_contacts(scores, top_k=2, min_sequence_separation=1)
 
-    assert [(item["position_i"], item["position_j"]) for item in contacts] == [
-        (0, 2),
-        (1, 2),
-    ]
+    assert [(item["position_i"], item["position_j"]) for item in contacts] == [(0, 2), (1, 2)]
     assert contacts[0]["position_i_1based"] == 1
     assert contacts[0]["position_j_1based"] == 3
 
@@ -78,80 +109,157 @@ def test_top_contacts_returns_ranked_upper_triangle():
 @pytest.mark.parametrize("top_k,separation", [(0, 1), (1, 0)])
 def test_top_contacts_validates_bounds(top_k, separation):
     with pytest.raises(ValueError):
-        _top_contacts(
-            np.zeros((2, 2)),
-            top_k=top_k,
-            min_sequence_separation=separation,
-        )
+        _top_contacts(np.zeros((2, 2)), top_k=top_k, min_sequence_separation=separation)
 
 
 def test_json_safe_replaces_non_finite_scientific_values():
-    result = _json_safe(
-        {
-            "array": np.array([1.0, np.nan, np.inf]),
-            "scalar": np.float32(-np.inf),
-        }
-    )
+    result = json_safe({"array": np.array([1.0, np.nan, np.inf]), "scalar": np.float32(-np.inf)})
 
     assert result == {"array": [1.0, None, None], "scalar": None}
     json.dumps(result, allow_nan=False)
+
+
+def test_bounded_summarizes_long_lists():
+    value = bounded({"short": [1, 2], "long": list(range(50))}, max_items=5)
+
+    assert value["short"] == [1, 2]
+    assert value["long"] == {"count": 50, "preview": [0, 1, 2, 3, 4], "truncated": True}
 
 
 def test_output_guards_refuse_overwrite(tmp_path):
     output_file = tmp_path / "scores.csv"
     output_file.write_text("existing")
     with pytest.raises(FileExistsError, match="overwrite=true"):
-        _prepare_file_output(str(output_file), overwrite=False)
+        prepare_file_output(str(output_file), overwrite=False)
 
     output_dir = tmp_path / "model"
     output_dir.mkdir()
-    (output_dir / "params.dat").write_text("existing")
-    with pytest.raises(FileExistsError, match="params.dat"):
-        _prepare_training_output(str(output_dir), overwrite=False)
+    (output_dir / "params.dat.gz").write_text("existing")
+    names = training_artifact_names(None).values()
+    with pytest.raises(FileExistsError, match="params.dat.gz"):
+        prepare_output_dir(str(output_dir), managed_names=names, overwrite=False)
+    assert prepare_output_dir(str(output_dir), managed_names=names, overwrite=True) == output_dir
 
 
-def test_labeled_training_can_share_directory_without_overwriting(tmp_path):
+def test_training_artifact_names_follow_adabmdca_2():
+    assert training_artifact_names(None)["params"] == "params.dat.gz"
+    assert training_artifact_names(None)["log"] == "adabmDCA.log"
+    labeled = training_artifact_names("edge", ptt=True)
+    assert labeled["params"] == "edge_params.dat.gz"
+    assert labeled["history"] == "edge_history.csv"
+    assert labeled["log"] == "edge.log"
+    assert labeled["ptt_archive"] == "edge_ptt.h5"
+
+
+def test_labeled_runs_can_share_a_directory(tmp_path):
     output_dir = tmp_path / "model"
     output_dir.mkdir()
-    (output_dir / "params.dat").write_text("existing default model")
+    (output_dir / "params.dat.gz").write_text("existing default model")
 
-    output, history = _prepare_training_output(
-        str(output_dir),
-        overwrite=False,
-        label="edgeDCA",
-    )
+    names = training_artifact_names("edgeDCA").values()
+    assert prepare_output_dir(str(output_dir), managed_names=names, overwrite=False) == output_dir
 
-    assert output == output_dir
-    assert history == output_dir / "edgeDCA_training_history.json"
-    (output_dir / "edgeDCA_params.dat").write_text("existing labeled model")
-    with pytest.raises(FileExistsError, match="edgeDCA_params.dat"):
-        _prepare_training_output(str(output_dir), overwrite=False, label="edgeDCA")
+
+def test_prefix_guard_detects_reintegration_outputs(tmp_path):
+    (tmp_path / "reintegrated-lambda_0.50_params.dat.gz").write_text("x")
+    with pytest.raises(FileExistsError, match="reintegrated-lambda_0.50"):
+        prepare_output_dir(
+            str(tmp_path), managed_prefixes=["reintegrated-lambda_"], overwrite=False
+        )
 
 
 @pytest.mark.parametrize("label", ["", "   ", "../model", "nested/model", "nested\\model"])
-def test_training_label_must_be_filename_safe(tmp_path, label):
-    with pytest.raises(ValueError, match="label"):
-        _prepare_training_output(str(tmp_path / "model"), overwrite=False, label=label)
+def test_label_must_be_filename_safe(label):
+    with pytest.raises(ValueError, match="Label"):
+        validated_label(label)
+
+
+def test_explicit_alphabet_is_kept():
+    assert resolve_alphabet("rna", model="anything") == "rna"
+    assert resolve_alphabet("auto") is None
+
+
+def test_surface_errors_exposes_adabmdca_messages():
+    from adabmDCA.exceptions import ModelLoadError
+
+    @surface_errors
+    def broken():
+        raise ModelLoadError("missing file", details={"path": "/x"})
+
+    with pytest.raises(ToolError, match=r"ModelLoadError \[model_load_error\]: missing file"):
+        broken()
+
+
+def test_hamming_potential_counts_mismatches():
+    potential = _hamming_potential("AC-G")
+    assert list(potential(["AC-G", "AA-G", "----"], 2.0)) == [0.0, 2.0, 6.0]
+
+
+def test_progress_snapshot_keeps_metrics_and_drops_none():
+    event = SimpleNamespace(epoch=4, metrics={"Pearson": np.float32(0.5)}, stage="optimization")
+    assert progress_snapshot(event) == {
+        "stage": "optimization",
+        "epoch": 4,
+        "metrics": {"Pearson": 0.5},
+    }
+
+
+def test_job_manager_runs_and_cancels():
+    from adabmDCA.exceptions import OperationCancelledError
+
+    jobs = JobManager()
+
+    def slow(progress, is_cancelled):
+        for step in range(500):
+            progress(SimpleNamespace(completed=step, total=500))
+            if is_cancelled():
+                raise OperationCancelledError("stopped")
+            time.sleep(0.01)
+        return {"done": True}
+
+    job = jobs.start("test", slow, {})
+    time.sleep(0.05)
+    jobs.cancel(job.id)
+    jobs.wait(job.id, timeout=5)
+    assert job.status == "cancelled"
+    assert job.progress["total"] == 500
+
+    quick = jobs.start("test", lambda progress, is_cancelled: {"value": 1}, {})
+    jobs.wait(quick.id, timeout=5)
+    assert quick.status == "succeeded"
+    assert quick.to_dict()["result"] == {"value": 1}
+    with pytest.raises(KeyError, match="Unknown job"):
+        jobs.get("missing")
+
+
+# ---------------------------------------------------------------------------
+# Tools with a fake adabmDCA
 
 
 def test_score_writes_all_records_and_bounds_inline_payload(tmp_path, monkeypatch):
+    written = {}
+
+    def to_csv(path):
+        written["path"] = path
+
     result = SimpleNamespace(
         names=("first", "second", "third"),
         sequences=("AA", "A-", "--"),
         energies=np.array([1.0, 2.0, 3.0]),
+        cde_sum=np.array([0.1, 0.2, 0.3]),
+        local_free_energies=np.array([0.9, 1.8, 2.7]),
+        local_lambda=1.0,
         model=_metadata(),
         warnings=(),
+        to_csv=to_csv,
     )
-    monkeypatch.setitem(
-        sys.modules,
-        "adabmDCA",
-        SimpleNamespace(score_sequences=lambda **kwargs: result),
-    )
+    _fake_adabmdca(monkeypatch, score_sequences=lambda **kwargs: result)
     output = tmp_path / "scores.csv"
 
     response = score_dca_sequences(
         "params.dat",
         sequences=list(result.sequences),
+        alphabet="protein",
         output_csv=str(output),
         max_inline_sequences=2,
     )
@@ -160,54 +268,84 @@ def test_score_writes_all_records_and_bounds_inline_payload(tmp_path, monkeypatc
     assert response["returned_sequences"] == 2
     assert response["truncated"] is True
     assert response["sequences"] == ["AA", "A-"]
-    assert output.read_text().splitlines() == [
-        "name,sequence,energy",
-        "first,AA,1.0",
-        "second,A-,2.0",
-        "third,--,3.0",
-    ]
+    assert response["cde_sum"] == pytest.approx([0.1, 0.2])
+    assert response["energy_stats"]["max"] == 3.0
+    assert written["path"] == output
 
 
-def test_sample_writes_all_sequences_and_bounds_inline_payload(tmp_path, monkeypatch):
+def _sampling_result():
     result = SimpleNamespace(
         sequences=("AA", "A-", "--"),
         energies=np.array([1.0, 2.0, 3.0]),
         num_sweeps=10,
-        sampler="gibbs",
+        sampler="metropolized_gibbs",
         beta=1.0,
         seed=7,
+        sampling_dtype="float32",
+        local_lambda_fit=None,
+        sampling_history={},
+        ptt_diagnostics={},
+        distance_comparison={},
+        steering={},
         model=_metadata(),
         warnings=(),
     )
-    monkeypatch.setitem(
-        sys.modules,
-        "adabmDCA",
-        SimpleNamespace(sample_sequences=lambda **kwargs: result),
-    )
+
+    def to_fasta(path):
+        content = "".join(f">sequence_{i}\n{s}\n" for i, s in enumerate(result.sequences, 1))
+        Path(path).write_text(content)
+        return Path(path)
+
+    result.to_fasta = to_fasta
+    return result
+
+
+def test_sample_writes_all_sequences_and_bounds_inline_payload(tmp_path, monkeypatch):
+    received = {}
+
+    def fake_sample(**kwargs):
+        received.update(kwargs)
+        return _sampling_result()
+
+    _fake_adabmdca(monkeypatch, sample_sequences=fake_sample)
     output = tmp_path / "samples.fasta"
 
-    response = sample_dca_sequences(
-        "params.dat",
-        n_sequences=3,
-        output_fasta=str(output),
-        max_inline_sequences=1,
+    response = asyncio.run(
+        sample_dca_sequences(
+            "params.dat",
+            n_sequences=3,
+            alphabet="protein",
+            output_fasta=str(output),
+            max_inline_sequences=1,
+        )
     )
 
     assert response["num_sequences"] == 3
     assert response["returned_sequences"] == 1
-    assert response["truncated"] is True
     assert response["sequences"] == ["AA"]
     assert output.read_text().count(">sequence_") == 3
+    assert received["sampler"] == "metropolized_gibbs"
+    assert received["ptt"] is False
+
+
+def test_sample_validates_ptt_and_steering_inputs(monkeypatch):
+    _fake_adabmdca(monkeypatch, sample_sequences=lambda **kwargs: _sampling_result())
+    with pytest.raises(ToolError, match="reference_fasta"):
+        asyncio.run(sample_dca_sequences("ptt.h5", n_sequences=2, ptt=True, alphabet="protein"))
+    with pytest.raises(ToolError, match="at most one"):
+        asyncio.run(
+            sample_dca_sequences(
+                "params.dat",
+                n_sequences=2,
+                alphabet="protein",
+                steering_target="AA",
+                steering_script="x.py:f",
+            )
+        )
 
 
 def test_contacts_write_complete_symmetrized_matrix(tmp_path, monkeypatch):
-    scores = np.array(
-        [
-            [0.0, 1.0, 4.0],
-            [1.2, 0.0, 3.0],
-            [3.6, 3.4, 0.0],
-        ]
-    )
+    scores = np.array([[0.0, 1.0, 4.0], [1.2, 0.0, 3.0], [3.6, 3.4, 0.0]])
     result = SimpleNamespace(
         scores=scores,
         method="mean_field",
@@ -216,16 +354,13 @@ def test_contacts_write_complete_symmetrized_matrix(tmp_path, monkeypatch):
         model=None,
         warnings=(),
     )
-    monkeypatch.setitem(
-        sys.modules,
-        "adabmDCA",
-        SimpleNamespace(predict_contacts=lambda **kwargs: result),
-    )
+    _fake_adabmdca(monkeypatch, predict_contacts=lambda **kwargs: result)
     output_csv = tmp_path / "contacts.csv"
     output_npy = tmp_path / "contacts.npy"
 
     response = predict_dca_contacts(
         fasta_path="alignment.fasta",
+        alphabet="protein",
         top_k=1,
         min_sequence_separation=1,
         output_csv=str(output_csv),
@@ -240,13 +375,12 @@ def test_contacts_write_complete_symmetrized_matrix(tmp_path, monkeypatch):
     assert response["contacts"][0]["score"] == pytest.approx(3.8)
     assert response["matrix"]["symmetrized"] is True
     assert response["matrix"]["max_abs_asymmetry_before"] == pytest.approx(0.4)
-    assert response["matrix"]["output_csv"] == str(output_csv)
-    assert response["matrix"]["output_npy"] == str(output_npy)
 
 
-def test_compare_contacts_writes_side_by_side_plot(tmp_path, monkeypatch):
+@pytest.mark.parametrize("color_scale", ["shared", "per_panel"])
+def test_compare_contacts_writes_side_by_side_plot(tmp_path, monkeypatch, color_scale):
     model_result = SimpleNamespace(
-        scores=np.array([[0.0, 2.0], [2.0, 0.0]]),
+        scores=np.array([[0.0, 20.0], [20.0, 0.0]]),
         method="model",
         alphabet="protein",
         tokens="-A",
@@ -265,123 +399,108 @@ def test_compare_contacts_writes_side_by_side_plot(tmp_path, monkeypatch):
     def fake_predict_contacts(**kwargs):
         return model_result if kwargs.get("model") else mean_field_result
 
-    monkeypatch.setitem(
-        sys.modules,
-        "adabmDCA",
-        SimpleNamespace(predict_contacts=fake_predict_contacts),
-    )
+    _fake_adabmdca(monkeypatch, predict_contacts=fake_predict_contacts)
     output = tmp_path / "comparison.png"
 
     response = compare_dca_contacts(
         "params.dat",
         "alignment.fasta",
         str(output),
+        alphabet="protein",
         top_k=1,
         min_sequence_separation=1,
+        color_scale=color_scale,
     )
 
     assert output.read_bytes().startswith(b"\x89PNG")
-    assert response["output_plot"] == str(output)
-    assert response["sequence_length"] == 2
-    assert response["mean_field"]["symmetry"]["max_abs_asymmetry_before"] == pytest.approx(0.00002)
+    assert response["color_scale"]["mode"] == color_scale
+    same = response["color_scale"]["mean_field"] == response["color_scale"]["model"]
+    assert same is (color_scale == "shared")
     assert response["model"]["metadata"]["device"] == "cpu"
 
 
-def test_training_sanitizes_progress_and_reports_non_convergence(tmp_path, monkeypatch):
-    def fake_train_model(data_path, *, progress, **kwargs):
-        progress(
-            SimpleNamespace(
-                epoch=5,
-                metrics={"Pearson": 0.2, "LL_val": np.nan, "Slope_val": np.inf},
-            )
-        )
-        return SimpleNamespace(
-            model=SimpleNamespace(metadata=_metadata()),
-            history={"Pearson": [0.1, 0.2], "LL_val": [np.nan, np.nan]},
-            pseudocount=0.01,
-            num_sequences=10,
-            effective_sequences=8.5,
-            artifacts={},
-            converged=False,
-            stop_reason="max_gradient_steps",
-            gradient_steps=5,
-            structure_steps=2,
-            sweeps=50,
-            input_report={"kept_sequences": 10},
-            warnings=(),
-        )
+def _training_result(tmp_path, *, converged):
+    def save_bundle(directory, label=None):
+        return {"summary": Path(directory) / f"{label + '_' if label else ''}training.json"}
 
-    monkeypatch.setitem(
-        sys.modules,
-        "adabmDCA",
-        SimpleNamespace(train_model=fake_train_model),
-    )
-    output = tmp_path / "model"
-
-    response = train_dca_model(
-        "alignment.fasta",
-        str(output),
-        max_epochs=5,
-        target_pearson=0.95,
+    return SimpleNamespace(
+        model=SimpleNamespace(metadata=_metadata()),
+        history={"Pearson": [0.1, 0.2], "LL_val": [np.nan, np.nan]},
+        pseudocount=0.01,
+        num_sequences=10,
+        effective_sequences=8.5,
+        artifacts={"params": tmp_path / "model" / "params.dat.gz"},
+        converged=converged,
+        stop_reason="target_pearson" if converged else "max_gradient_steps",
+        gradient_steps=5,
+        structure_steps=2,
+        sweeps=50,
+        final_metrics={"Pearson": 0.2, "LL_val": np.nan},
+        config=None,
+        initialization=None,
+        partition_estimate=None,
+        input_report={"retained_indices": list(range(420))},
+        warnings=(),
+        save_bundle=save_bundle,
     )
 
-    assert response["epochs_completed"] == 5
+
+def test_training_reports_native_convergence_and_bounds_input_report(tmp_path, monkeypatch):
+    received = {}
+
+    def fake_train_model(data_path, **kwargs):
+        received.update(kwargs)
+        kwargs["progress"](SimpleNamespace(epoch=5, metrics={"Pearson": 0.2}))
+        return _training_result(tmp_path, converged=False)
+
+    _fake_adabmdca(monkeypatch, train_model=fake_train_model)
+
+    response = asyncio.run(
+        train_dca_model(
+            "alignment.fasta",
+            str(tmp_path / "model"),
+            alphabet="protein",
+            label="edgeDCA",
+            max_epochs=5,
+        )
+    )
+
+    assert received["label"] == "edgeDCA"
+    assert received["max_epochs"] == 5
+    assert "learning_rate" not in received  # unset options keep adabmDCA defaults
+    assert received["ptt"] is None
     assert response["converged"] is False
     assert response["stop_reason"] == "max_gradient_steps"
-    assert response["gradient_steps"] == 5
-    assert response["structure_steps"] == 2
-    assert response["sweeps"] == 50
-    assert response["input_report"] == {"kept_sequences": 10}
-    assert response["final_progress"]["metrics"]["LL_val"] is None
-    assert response["final_progress"]["metrics"]["Slope_val"] is None
-    assert "without reaching target Pearson" in response["warnings"][-1]
-    history = json.loads((output / "training_history.json").read_text())
-    assert history["LL_val"] == [None, None]
+    assert response["final_metrics"]["LL_val"] is None
+    assert response["input_report"]["retained_indices"]["count"] == 420
+    assert response["artifacts"]["summary"].endswith("edgeDCA_training.json")
+    assert "without converging" in response["warnings"][-1]
     json.dumps(response, allow_nan=False)
 
 
-def test_training_forwards_label_and_uses_labeled_history(tmp_path, monkeypatch):
-    received = {}
+def test_training_refuses_existing_artifacts(tmp_path, monkeypatch):
+    _fake_adabmdca(
+        monkeypatch, train_model=lambda *a, **k: _training_result(tmp_path, converged=True)
+    )
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "history.csv").write_text("x")
 
-    def fake_train_model(data_path, *, progress, **kwargs):
-        received.update(kwargs)
-        progress(SimpleNamespace(epoch=3, metrics={"Pearson": 0.8}))
-        return SimpleNamespace(
-            model=SimpleNamespace(metadata=_metadata()),
-            history={"Pearson": [0.4, 0.6, 0.8]},
-            pseudocount=0.01,
-            num_sequences=10,
-            effective_sequences=8.5,
-            artifacts={"params": tmp_path / "model" / "edgeDCA_params.dat"},
-            converged=True,
-            stop_reason="target_pearson",
-            gradient_steps=3,
-            structure_steps=3,
-            sweeps=30,
-            input_report={},
-            warnings=(),
-        )
+    with pytest.raises(ToolError, match="history.csv"):
+        asyncio.run(train_dca_model("a.fasta", str(tmp_path / "model"), alphabet="protein"))
 
-    monkeypatch.setitem(
-        sys.modules,
-        "adabmDCA",
-        SimpleNamespace(train_model=fake_train_model),
+
+def test_training_in_background_returns_job(tmp_path, monkeypatch):
+    _fake_adabmdca(
+        monkeypatch, train_model=lambda *a, **k: _training_result(tmp_path, converged=True)
     )
 
-    response = train_dca_model(
-        "alignment.fasta",
-        str(tmp_path / "model"),
-        label="edgeDCA",
-        target_pearson=0.7,
+    started = asyncio.run(
+        train_dca_model("a.fasta", str(tmp_path / "model"), alphabet="protein", background=True)
     )
+    report = get_dca_job(started["job_id"], wait_seconds=5)
 
-    history = tmp_path / "model" / "edgeDCA_training_history.json"
-    assert received["label"] == "edgeDCA"
-    assert history.exists()
-    assert response["label"] == "edgeDCA"
-    assert response["artifacts"]["history"] == str(history)
-    assert response["converged"] is True
-    assert response["stop_reason"] == "target_pearson"
+    assert report["status"] == "succeeded"
+    assert report["result"]["converged"] is True
 
 
 def test_mcp_registers_all_public_tools():
@@ -395,5 +514,14 @@ def test_mcp_registers_all_public_tools():
         "scan_dca_mutations",
         "sample_dca_sequences",
         "preprocess_dca_alignment",
+        "split_dca_alignment",
         "train_dca_model",
+        "reintegrate_dca_model",
+        "plot_dca_training_history",
+        "estimate_dca_entropy",
+        "get_dca_job",
+        "list_dca_jobs",
+        "cancel_dca_job",
     }
+    for tool in tools:
+        assert "ctx" not in tool.input_schema.get("properties", {})

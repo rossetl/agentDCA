@@ -1,126 +1,99 @@
-"""MCP tools backed by the high-level adabmDCA Python API."""
+"""MCP tools backed by the high-level adabmDCA 2.x Python API."""
 
 from __future__ import annotations
 
-import csv
-import json
+import importlib.util
 import math
 from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
+
+from agentdca._common import (
+    compact,
+    inline_limit,
+    json_safe,
+    prepare_file_output,
+    prepare_output_dir,
+    resolve_alphabet,
+    surface_errors,
+    training_artifact_names,
+    validated_label,
+)
+from agentdca.jobs import JOBS, IsCancelled, Progress, run_foreground
 
 mcp = MCPServer(
     "agentDCA",
     instructions=(
         "Use these tools to inspect and operate adabmDCA models and alignments. "
-        "Inspect inputs before expensive sampling or training operations."
+        "Inspect inputs before expensive sampling or training operations. "
+        "Long runs (training, reintegration, PTT sampling, entropy) accept background=true "
+        "and are then followed with get_dca_job / cancel_dca_job."
     ),
 )
 
+Device = Literal["auto", "cpu", "cuda", "mps"]
+Sampler = Literal["metropolized_gibbs", "gibbs", "metropolis"]
+ModelType = Literal["bmDCA", "eaDCA", "edDCA", "edgeDCA"]
 
-def _metadata_dict(metadata: Any) -> dict[str, Any]:
-    return metadata.to_dict()
-
-
-def _json_safe(value: Any) -> Any:
-    """Convert nested scientific values to strict JSON-compatible objects."""
-    if isinstance(value, np.ndarray):
-        return [_json_safe(item) for item in value.tolist()]
-    if isinstance(value, np.generic):
-        return _json_safe(value.item())
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    return value
+# Backwards-compatible aliases used by the test-suite and external scripts.
+_json_safe = json_safe
+_prepare_file_output = prepare_file_output
 
 
-def _prepare_file_output(path: str, *, overwrite: bool) -> Path:
-    output = Path(path).expanduser()
-    if output.exists():
-        if output.is_dir():
-            raise ValueError(f"Output path '{output}' is a directory.")
-        if not overwrite:
-            raise FileExistsError(
-                f"Output file '{output}' already exists. Set overwrite=true to replace it."
-            )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    return output
+def _metadata_dict(metadata: Any) -> dict[str, Any] | None:
+    return None if metadata is None else json_safe(metadata.to_dict())
 
 
-def _validated_label(label: str | None) -> str | None:
-    if label is None:
-        return None
-    if not label.strip():
-        raise ValueError("Training label cannot be empty.")
-    if label in {".", ".."} or Path(label).name != label or "/" in label or "\\" in label:
-        raise ValueError("Training label must be a single filename-safe component.")
-    return label
+def _path(value: str | None) -> str | None:
+    return None if value is None else str(Path(value).expanduser())
 
 
-def _training_artifact_names(label: str | None) -> dict[str, str]:
-    if label is None:
-        return {
-            "log": "adabmDCA.log",
-            "params": "params.dat",
-            "chains": "chains.fasta",
-            "weights": "weights.dat",
-            "history": "training_history.json",
+def _energy_stats(energies: Any) -> dict[str, float | None]:
+    values = np.asarray(energies, dtype=float)
+    if values.size == 0:
+        return {"mean": None, "std": None, "min": None, "max": None}
+    return json_safe(
+        {
+            "mean": float(values.mean()),
+            "std": float(values.std()),
+            "min": float(values.min()),
+            "max": float(values.max()),
         }
-    return {
-        "log": f"{label}.log",
-        "params": f"{label}_params.dat",
-        "chains": f"{label}_chains.fasta",
-        "weights": f"{label}_weights.dat",
-        "history": f"{label}_training_history.json",
-    }
+    )
 
 
-def _prepare_training_output(
-    path: str,
+def _preview(values: Any, limit: int) -> list[Any]:
+    if values is None:
+        return []
+    return [json_safe(value) for value in list(values)[:limit]]
+
+
+async def _dispatch(
+    ctx: Context | None,
     *,
-    overwrite: bool,
-    label: str | None = None,
-) -> tuple[Path, Path]:
-    output = Path(path).expanduser()
-    if output.exists() and not output.is_dir():
-        raise ValueError(f"Training output path '{output}' is not a directory.")
-    label = _validated_label(label)
-    artifact_names = _training_artifact_names(label)
-    managed_names = set(artifact_names.values())
-    existing = sorted(name for name in managed_names if (output / name).exists())
-    if existing and not overwrite:
-        raise FileExistsError(
-            f"Training output directory '{output}' contains existing artifacts: "
-            f"{', '.join(existing)}. Set overwrite=true to replace them."
-        )
-    output.mkdir(parents=True, exist_ok=True)
-    return output, output / artifact_names["history"]
+    kind: str,
+    background: bool,
+    parameters: dict[str, Any],
+    work: Any,
+) -> dict[str, Any]:
+    if background:
+        job = JOBS.start(kind, work, parameters)
+        return {
+            "job_id": job.id,
+            "status": job.status,
+            "message": (
+                f"{kind} started in the background. Poll get_dca_job('{job.id}') for "
+                "progress and the final result; cancel_dca_job stops it cleanly."
+            ),
+        }
+    return await run_foreground(ctx, work)
 
 
-def _inline_limit(max_inline_sequences: int) -> int:
-    if max_inline_sequences < 0:
-        raise ValueError("max_inline_sequences cannot be negative.")
-    return max_inline_sequences
-
-
-def _write_energy_csv(path: Path, result: Any) -> None:
-    names = result.names or tuple(f"sequence_{index + 1}" for index in range(len(result.sequences)))
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["name", "sequence", "energy"])
-        for name, sequence, energy in zip(names, result.sequences, result.energies):
-            writer.writerow([name, sequence, float(energy)])
-
-
-def _write_sample_fasta(path: Path, result: Any) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        for index, (sequence, energy) in enumerate(zip(result.sequences, result.energies), start=1):
-            handle.write(f">sequence_{index} | DCAenergy: {float(energy):.3f}\n{sequence}\n")
+# ---------------------------------------------------------------------------
+# Contacts
 
 
 def _top_contacts(
@@ -181,10 +154,10 @@ def _prepare_contact_outputs(
     if len(normalized) != len(set(normalized)):
         raise ValueError("Contact CSV and NPY outputs must use different paths.")
     csv_output = (
-        None if output_csv is None else _prepare_file_output(output_csv, overwrite=overwrite)
+        None if output_csv is None else prepare_file_output(output_csv, overwrite=overwrite)
     )
     npy_output = (
-        None if output_npy is None else _prepare_file_output(output_npy, overwrite=overwrite)
+        None if output_npy is None else prepare_file_output(output_npy, overwrite=overwrite)
     )
     return csv_output, npy_output
 
@@ -202,57 +175,93 @@ def _write_contact_outputs(
             np.save(handle, scores)
 
 
+def _color_limits(*matrices: np.ndarray) -> tuple[float, float]:
+    finite = np.concatenate([matrix[np.isfinite(matrix)] for matrix in matrices])
+    if finite.size == 0:
+        raise ValueError("Contact matrices contain no finite scores to plot.")
+    vmin, vmax = (float(value) for value in np.percentile(finite, [1, 99]))
+    if math.isclose(vmin, vmax):
+        padding = max(abs(vmin) * 0.01, 1e-6)
+        vmin -= padding
+        vmax += padding
+    return vmin, vmax
+
+
+# ---------------------------------------------------------------------------
+# Model inspection, scoring, contacts, mutations
+
+
 @mcp.tool()
+@surface_errors
 def inspect_dca_model(
     model_path: str,
-    alphabet: str = "protein",
-    device: str = "auto",
+    alphabet: str = "auto",
+    device: Device = "auto",
     dtype: str = "float32",
 ) -> dict[str, Any]:
-    """Inspect a saved adabmDCA parameter file without running an analysis."""
+    """Inspect a saved adabmDCA parameter file (.dat, .dat.gz) or PTT archive (.h5).
+
+    alphabet="auto" detects protein/RNA/DNA from the file, like the adabmDCA CLI.
+    """
     from adabmDCA import inspect_model
 
-    metadata = inspect_model(model_path, alphabet=alphabet, device=device, dtype=dtype)
+    model_path = _path(model_path)
+    resolved = resolve_alphabet(alphabet, model=model_path)
+    metadata = inspect_model(model_path, alphabet=resolved, device=device, dtype=dtype)
     return _metadata_dict(metadata)
 
 
 @mcp.tool()
+@surface_errors
 def score_dca_sequences(
     model_path: str,
     sequences: list[str] | None = None,
     fasta_path: str | None = None,
-    alphabet: str = "protein",
-    device: str = "auto",
+    alphabet: str = "auto",
+    device: Device = "auto",
     dtype: str = "float32",
     remove_duplicates: bool = False,
+    local_lambda: float | None = 1.0,
     output_csv: str | None = None,
     overwrite: bool = False,
     max_inline_sequences: int = 100,
 ) -> dict[str, Any]:
-    """Compute energies, optionally write all records, and return a bounded preview."""
+    """Compute DCA energies (lower = more probable under the model) for aligned sequences.
+
+    Also returns the summed context-dependent entropy (cde_sum) and the local free energy
+    energy - local_lambda * cde_sum; set local_lambda=null to skip them. Writes every record
+    to output_csv when given and returns a bounded preview.
+    """
     from adabmDCA import score_sequences
 
-    limit = _inline_limit(max_inline_sequences)
-    output = None if output_csv is None else _prepare_file_output(output_csv, overwrite=overwrite)
+    limit = inline_limit(max_inline_sequences)
+    output = None if output_csv is None else prepare_file_output(output_csv, overwrite=overwrite)
+    model_path, fasta_path = _path(model_path), _path(fasta_path)
+    resolved = resolve_alphabet(alphabet, model=model_path, data=fasta_path)
     result = score_sequences(
         sequences=sequences,
         fasta_path=fasta_path,
         model=model_path,
-        alphabet=alphabet,
+        alphabet=resolved,
         device=device,
         dtype=dtype,
         remove_duplicates=remove_duplicates,
+        local_lambda=local_lambda,
     )
     if output is not None:
-        _write_energy_csv(output, result)
+        result.to_csv(output)
     count = len(result.sequences)
     returned = min(count, limit)
     names = result.names or tuple(f"sequence_{index + 1}" for index in range(count))
-    return _json_safe(
+    return json_safe(
         {
             "names": list(names[:returned]),
             "sequences": list(result.sequences[:returned]),
-            "energies": [float(value) for value in result.energies[:returned]],
+            "energies": _preview(result.energies, returned),
+            "cde_sum": _preview(result.cde_sum, returned),
+            "local_free_energies": _preview(result.local_free_energies, returned),
+            "local_lambda": result.local_lambda,
+            "energy_stats": _energy_stats(result.energies),
             "num_sequences": count,
             "returned_sequences": returned,
             "truncated": returned < count,
@@ -264,21 +273,25 @@ def score_dca_sequences(
 
 
 @mcp.tool()
+@surface_errors
 def predict_dca_contacts(
     model_path: str | None = None,
     fasta_path: str | None = None,
-    alphabet: str = "protein",
+    alphabet: str = "auto",
     pseudocount: float = 0.5,
     top_k: int = 100,
     min_sequence_separation: int = 5,
-    device: str = "auto",
+    device: Device = "auto",
     dtype: str = "float32",
     symmetrize: bool = True,
     output_csv: str | None = None,
     output_npy: str | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Rank contacts and optionally save the complete contact-score matrix."""
+    """Rank APC-corrected contact scores from a model, or mean-field DCA from an alignment.
+
+    Give exactly one of model_path or fasta_path. Optionally saves the full matrix.
+    """
     from adabmDCA import predict_contacts
 
     csv_output, npy_output = _prepare_contact_outputs(
@@ -286,17 +299,19 @@ def predict_dca_contacts(
         output_npy=output_npy,
         overwrite=overwrite,
     )
+    model_path, fasta_path = _path(model_path), _path(fasta_path)
+    resolved = resolve_alphabet(alphabet, model=model_path, data=fasta_path)
     result = predict_contacts(
         model=model_path,
         fasta_path=fasta_path,
-        alphabet=alphabet,
+        alphabet=resolved,
         pseudocount=pseudocount,
         device=device,
         dtype=dtype,
     )
     scores, symmetry = _normalize_contact_scores(result.scores, symmetrize=symmetrize)
     _write_contact_outputs(scores, output_csv=csv_output, output_npy=npy_output)
-    return _json_safe(
+    return json_safe(
         {
             "method": result.method,
             "alphabet": result.alphabet,
@@ -313,55 +328,57 @@ def predict_dca_contacts(
                 "output_npy": None if npy_output is None else str(npy_output),
                 **symmetry,
             },
-            "model": None if result.model is None else _metadata_dict(result.model),
+            "model": _metadata_dict(result.model),
             "warnings": list(result.warnings),
         }
     )
 
 
 @mcp.tool()
+@surface_errors
 def compare_dca_contacts(
     model_path: str,
     fasta_path: str,
     output_plot: str,
-    alphabet: str = "protein",
+    alphabet: str = "auto",
     pseudocount: float = 0.5,
     top_k: int = 100,
     min_sequence_separation: int = 5,
-    device: str = "auto",
+    color_scale: Literal["shared", "per_panel"] = "shared",
+    device: Device = "auto",
     dtype: str = "float32",
     symmetrize: bool = True,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Plot mean-field and model contact matrices side by side and return ranked contacts."""
+    """Plot mean-field and model contact matrices side by side and return ranked contacts.
+
+    color_scale="shared" (default) makes the panels directly comparable; "per_panel" gives
+    each panel its own 1st-99th percentile range, which helps when one model's scores are
+    much smaller.
+    """
     from adabmDCA import predict_contacts
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
-    plot_output = _prepare_file_output(output_plot, overwrite=overwrite)
+    plot_output = prepare_file_output(output_plot, overwrite=overwrite)
     if plot_output.suffix.lower() not in {".png", ".pdf", ".svg"}:
         raise ValueError("Contact comparison plot must use a .png, .pdf, or .svg extension.")
 
-    model_result = predict_contacts(
-        model=model_path,
-        alphabet=alphabet,
-        device=device,
-        dtype=dtype,
-    )
+    model_path, fasta_path = _path(model_path), _path(fasta_path)
+    resolved = resolve_alphabet(alphabet, model=model_path, data=fasta_path)
+    model_result = predict_contacts(model=model_path, alphabet=resolved, device=device, dtype=dtype)
     mean_field_result = predict_contacts(
         fasta_path=fasta_path,
-        alphabet=alphabet,
+        alphabet=resolved,
         pseudocount=pseudocount,
         device=device,
         dtype=dtype,
     )
     model_scores, model_symmetry = _normalize_contact_scores(
-        model_result.scores,
-        symmetrize=symmetrize,
+        model_result.scores, symmetrize=symmetrize
     )
     mean_field_scores, mean_field_symmetry = _normalize_contact_scores(
-        mean_field_result.scores,
-        symmetrize=symmetrize,
+        mean_field_result.scores, symmetrize=symmetrize
     )
     if model_scores.shape != mean_field_scores.shape:
         raise ValueError(
@@ -369,43 +386,42 @@ def compare_dca_contacts(
             f"{model_scores.shape} and {mean_field_scores.shape}."
         )
 
-    finite_values = np.concatenate(
-        [
-            model_scores[np.isfinite(model_scores)],
-            mean_field_scores[np.isfinite(mean_field_scores)],
-        ]
-    )
-    if finite_values.size == 0:
-        raise ValueError("Contact matrices contain no finite scores to plot.")
-    vmin, vmax = (float(value) for value in np.percentile(finite_values, [1, 99]))
-    if math.isclose(vmin, vmax):
-        padding = max(abs(vmin) * 0.01, 1e-6)
-        vmin -= padding
-        vmax += padding
+    panels = (("Mean-field DCA", mean_field_scores), ("DCA model", model_scores))
+    if color_scale == "shared":
+        shared = _color_limits(mean_field_scores, model_scores)
+        limits = [shared, shared]
+    else:
+        limits = [_color_limits(scores) for _, scores in panels]
 
     figure = Figure(figsize=(12, 5.2), constrained_layout=True)
     FigureCanvasAgg(figure)
     axes = figure.subplots(1, 2)
     image = None
-    for axis, title, scores in zip(
-        axes,
-        ("Mean-field DCA", "DCA model"),
-        (mean_field_scores, model_scores),
-    ):
+    for axis, (title, scores), (vmin, vmax) in zip(axes, panels, limits):
         image = axis.imshow(scores, origin="lower", cmap="viridis", vmin=vmin, vmax=vmax)
         axis.set_title(title)
         axis.set_xlabel("Residue position")
         axis.set_ylabel("Residue position")
         axis.set_aspect("equal")
-    figure.colorbar(image, ax=axes, label="APC-corrected contact score", shrink=0.86)
+        if color_scale == "per_panel":
+            figure.colorbar(image, ax=axis, label="APC-corrected contact score", shrink=0.86)
+    if color_scale == "shared":
+        figure.colorbar(image, ax=axes, label="APC-corrected contact score", shrink=0.86)
     figure.suptitle("DCA contact-score matrices", fontsize=14)
     figure.savefig(plot_output)
 
-    return _json_safe(
+    def scale(index: int) -> dict[str, Any]:
+        return {"vmin": limits[index][0], "vmax": limits[index][1], "percentiles": [1, 99]}
+
+    return json_safe(
         {
             "output_plot": str(plot_output),
             "sequence_length": int(model_scores.shape[0]),
-            "color_scale": {"vmin": vmin, "vmax": vmax, "percentiles": [1, 99]},
+            "color_scale": {
+                "mode": color_scale,
+                "mean_field": scale(0),
+                "model": scale(1),
+            },
             "mean_field": {
                 "method": mean_field_result.method,
                 "symmetry": mean_field_symmetry,
@@ -418,9 +434,7 @@ def compare_dca_contacts(
             },
             "model": {
                 "method": model_result.method,
-                "metadata": (
-                    None if model_result.model is None else _metadata_dict(model_result.model)
-                ),
+                "metadata": _metadata_dict(model_result.model),
                 "symmetry": model_symmetry,
                 "contacts": _top_contacts(
                     model_scores,
@@ -434,111 +448,304 @@ def compare_dca_contacts(
 
 
 @mcp.tool()
+@surface_errors
 def scan_dca_mutations(
     model_path: str,
     wild_type: str,
-    alphabet: str = "protein",
+    alphabet: str = "auto",
     include_gap: bool = False,
     top_k: int = 100,
     ranking: Literal["most_favorable", "largest_effect"] = "most_favorable",
-    device: str = "auto",
+    device: Device = "auto",
     dtype: str = "float32",
+    output_csv: str | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Score single substitutions and return a ranked subset of mutation effects."""
+    """Score every single substitution of a wild type (deep mutational scan).
+
+    Returns a ranked subset; output_csv saves the complete scan.
+    """
     from adabmDCA import scan_mutations
 
     if top_k < 1:
         raise ValueError("top_k must be at least 1")
+    output = None if output_csv is None else prepare_file_output(output_csv, overwrite=overwrite)
+    model_path = _path(model_path)
+    resolved = resolve_alphabet(alphabet, model=model_path)
     result = scan_mutations(
         wild_type,
         model=model_path,
-        alphabet=alphabet,
+        alphabet=resolved,
         include_gap=include_gap,
         device=device,
         dtype=dtype,
     )
+    if output is not None:
+        result.to_csv(output)
     records = list(result.mutations)
     if ranking == "largest_effect":
         records.sort(key=lambda record: abs(record.delta_energy), reverse=True)
     else:
         records.sort(key=lambda record: record.delta_energy)
-    return {
-        "wild_type": result.wild_type,
-        "wild_type_energy": result.wild_type_energy,
-        "ranking": ranking,
-        "mutations": [
-            {
-                "mutation": record.label,
-                "position": record.position,
-                "position_1based": record.position_1based,
-                "wild_type": record.wild_type,
-                "mutant": record.mutant,
-                "delta_energy": record.delta_energy,
-                "sequence": record.sequence,
-            }
-            for record in records[:top_k]
-        ],
-        "total_mutations": len(result.mutations),
-        "model": _metadata_dict(result.model),
-    }
-
-
-@mcp.tool()
-def sample_dca_sequences(
-    model_path: str,
-    n_sequences: int,
-    n_sweeps: int = 1000,
-    sampler: Literal["gibbs", "metropolis"] = "gibbs",
-    beta: float = 1.0,
-    seed: int = 0,
-    alphabet: str = "protein",
-    device: str = "auto",
-    dtype: str = "float32",
-    output_fasta: str | None = None,
-    overwrite: bool = False,
-    max_inline_sequences: int = 100,
-) -> dict[str, Any]:
-    """Generate sequences, optionally write FASTA, and return a bounded preview."""
-    from adabmDCA import sample_sequences
-
-    limit = _inline_limit(max_inline_sequences)
-    output = (
-        None if output_fasta is None else _prepare_file_output(output_fasta, overwrite=overwrite)
-    )
-    result = sample_sequences(
-        model=model_path,
-        n_sequences=n_sequences,
-        n_sweeps=n_sweeps,
-        sampler=sampler,
-        beta=beta,
-        seed=seed,
-        alphabet=alphabet,
-        device=device,
-        dtype=dtype,
-    )
-    if output is not None:
-        _write_sample_fasta(output, result)
-    count = len(result.sequences)
-    returned = min(count, limit)
-    return _json_safe(
+    return json_safe(
         {
-            "sequences": list(result.sequences[:returned]),
-            "energies": [float(value) for value in result.energies[:returned]],
-            "num_sequences": count,
-            "returned_sequences": returned,
-            "truncated": returned < count,
-            "output_fasta": None if output is None else str(output),
-            "num_sweeps": result.num_sweeps,
-            "sampler": result.sampler,
-            "beta": result.beta,
-            "seed": result.seed,
+            "wild_type": result.wild_type,
+            "wild_type_energy": result.wild_type_energy,
+            "ranking": ranking,
+            "mutations": [
+                {
+                    "mutation": record.label,
+                    "position": record.position,
+                    "position_1based": record.position_1based,
+                    "wild_type": record.wild_type,
+                    "mutant": record.mutant,
+                    "delta_energy": record.delta_energy,
+                    "sequence": record.sequence,
+                }
+                for record in records[:top_k]
+            ],
+            "total_mutations": len(result.mutations),
+            "delta_energy_stats": _energy_stats(result.delta_energies),
+            "output_csv": None if output is None else str(output),
             "model": _metadata_dict(result.model),
             "warnings": list(result.warnings),
         }
     )
 
 
+# ---------------------------------------------------------------------------
+# Sampling
+
+
+def _hamming_potential(target: str):
+    target_array = np.frombuffer(target.encode("ascii"), dtype=np.uint8)
+
+    def potential(sequences: Any, strength: float) -> np.ndarray:
+        distances = np.array(
+            [
+                np.count_nonzero(
+                    np.frombuffer(sequence.encode("ascii"), dtype=np.uint8) != target_array
+                )
+                for sequence in sequences
+            ],
+            dtype=float,
+        )
+        return strength * distances
+
+    return potential
+
+
+def _load_steering_script(spec: str):
+    path_text, _, function_name = spec.rpartition(":")
+    if not path_text or not function_name:
+        raise ValueError("steering_script must look like '/path/to/potential.py:function_name'.")
+    path = Path(path_text).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"Steering script '{path}' was not found.")
+    module_spec = importlib.util.spec_from_file_location(f"agentdca_steering_{path.stem}", path)
+    if module_spec is None or module_spec.loader is None:
+        raise ImportError(f"Cannot import steering script '{path}'.")
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    try:
+        return getattr(module, function_name)
+    except AttributeError:
+        raise AttributeError(f"Steering script '{path}' defines no '{function_name}'.") from None
+
+
+def _sampling_summary(
+    result: Any,
+    *,
+    limit: int,
+    artifacts: dict[str, Any],
+) -> dict[str, Any]:
+    count = len(result.sequences)
+    returned = min(count, limit)
+    distance = result.distance_comparison or {}
+    privet = distance.get("privet") or {}
+    privet_summary = {
+        key: privet[key]
+        for key in ("n_generated", "n_flagged", "n_memorized", "n_pleaks", "excess_train")
+        if key in privet
+    }
+    ptt = result.ptt_diagnostics or {}
+    pearson_history = (result.sampling_history or {}).get("pearson") or [None]
+    summary = {
+        "sequences": list(result.sequences[:returned]),
+        "energies": _preview(result.energies, returned),
+        "energy_stats": _energy_stats(result.energies),
+        "num_sequences": count,
+        "returned_sequences": returned,
+        "truncated": returned < count,
+        "num_sweeps": result.num_sweeps,
+        "sampler": result.sampler,
+        "beta": result.beta,
+        "seed": result.seed,
+        "sampling_dtype": result.sampling_dtype,
+        "local_lambda_fit": result.local_lambda_fit,
+        "final_cij_pearson": list(pearson_history)[-1],
+        "ptt_mixing": ptt.get("mixing"),
+        "distances": distance.get("summary"),
+        "privet": privet_summary or None,
+        "steering": result.steering or None,
+        "artifacts": artifacts,
+        "model": _metadata_dict(result.model),
+        "warnings": list(result.warnings),
+    }
+    return compact(summary, max_items=max(returned, 20))
+
+
 @mcp.tool()
+@surface_errors
+async def sample_dca_sequences(
+    model_path: str,
+    n_sequences: int,
+    n_sweeps: int = 1000,
+    sampler: Sampler = "metropolized_gibbs",
+    beta: float = 1.0,
+    seed: int = 0,
+    alphabet: str = "auto",
+    device: Device = "auto",
+    dtype: str | None = None,
+    reference_fasta: str | None = None,
+    test_fasta: str | None = None,
+    weights_path: str | None = None,
+    collect_diagnostics: bool = False,
+    mixing_multiplier: int = 2,
+    ptt: bool = False,
+    ptt_local_sweeps: int = 10,
+    ptt_max_rounds: int = 20_000,
+    ptt_mixing_method: Literal["renewal", "autocorrelation"] = "renewal",
+    ptt_renewal_tolerance: float = 0.01,
+    ptt_stationary: bool = False,
+    ptt_local_kernel: Literal["archived", "metropolized_gibbs", "gibbs", "metropolis"] = "archived",
+    ptt_return_full_ladder: bool = False,
+    steering_target: str | None = None,
+    steering_script: str | None = None,
+    steering_strength: float = 1.0,
+    output_dir: str | None = None,
+    label: str | None = None,
+    output_fasta: str | None = None,
+    overwrite: bool = False,
+    max_inline_sequences: int = 100,
+    background: bool = False,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Generate sequences from a DCA model, optionally with diagnostics, PTT or steering.
+
+    - Ordinary MCMC: runs n_sweeps sweeps; with reference_fasta it first measures the mixing
+      time and runs mixing_multiplier mixing times instead.
+    - collect_diagnostics=true (needs reference_fasta) compares samples with the data: Cij
+      Pearson, PCA, cluster occupancy, Hamming distances and, with test_fasta, the PRIVET
+      overfitting check. With output_dir, diagnostic PNGs are also written.
+    - ptt=true samples a PTT archive (model_path = the training ptt.h5) and needs
+      reference_fasta; it ignores n_sweeps and beta and runs until its mixing check passes.
+    - Steering biases sampling by V(x, s): steering_target pulls samples toward an aligned
+      target sequence (V = s * Hamming distance); steering_script='file.py:function' loads a
+      user-written V(sequences, s). The result carries importance weights back to the
+      unsteered model. steering_script executes that Python file in this server.
+    - output_dir writes the package bundle (samples FASTA/CSV, JSON summary, logs);
+      output_fasta writes only a FASTA.
+    """
+    from adabmDCA import sample_sequences
+
+    limit = inline_limit(max_inline_sequences)
+    label = validated_label(label)
+    if steering_target is not None and steering_script is not None:
+        raise ValueError("Give at most one of steering_target and steering_script.")
+    if collect_diagnostics and reference_fasta is None:
+        raise ValueError("collect_diagnostics=true needs reference_fasta.")
+    if ptt and reference_fasta is None:
+        raise ValueError("PTT sampling needs reference_fasta (the training alignment).")
+    model_path = _path(model_path)
+    reference_fasta, test_fasta, weights_path = (
+        _path(reference_fasta),
+        _path(test_fasta),
+        _path(weights_path),
+    )
+    fasta_output = (
+        None if output_fasta is None else prepare_file_output(output_fasta, overwrite=overwrite)
+    )
+    folder = None
+    if output_dir is not None:
+        prefix = f"{label}_" if label else ""
+        folder = prepare_output_dir(
+            output_dir,
+            managed_names=[
+                f"{prefix}samples.fasta",
+                f"{prefix}samples.csv",
+                f"{prefix}sampling.json",
+            ],
+            overwrite=overwrite,
+        )
+    resolved = resolve_alphabet(alphabet, model=model_path, data=reference_fasta)
+    potential = None
+    if steering_target is not None:
+        potential = _hamming_potential(steering_target)
+    elif steering_script is not None:
+        potential = _load_steering_script(steering_script)
+
+    parameters = {
+        "model_path": model_path,
+        "n_sequences": n_sequences,
+        "ptt": ptt,
+        "sampler": sampler,
+        "seed": seed,
+        "output_dir": None if folder is None else str(folder),
+    }
+
+    def work(progress: Progress, is_cancelled: IsCancelled) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+        if potential is not None:
+            kwargs.update(steering_potential=potential, steering_strength=steering_strength)
+        result = sample_sequences(
+            model=model_path,
+            n_sequences=n_sequences,
+            ptt=ptt,
+            ptt_local_sweeps=ptt_local_sweeps,
+            ptt_max_rounds=ptt_max_rounds,
+            ptt_mixing_method=ptt_mixing_method,
+            ptt_renewal_tolerance=ptt_renewal_tolerance,
+            ptt_stationary=ptt_stationary,
+            ptt_local_kernel=None if ptt_local_kernel == "archived" else ptt_local_kernel,
+            ptt_return_full_ladder=ptt_return_full_ladder,
+            n_sweeps=n_sweeps,
+            # PTT archives keep their training sampler unless a local kernel is chosen.
+            sampler=None if ptt else sampler,
+            beta=beta,
+            seed=seed,
+            reference_fasta=reference_fasta,
+            test_fasta=test_fasta,
+            weights_path=weights_path,
+            mixing_multiplier=mixing_multiplier,
+            collect_diagnostics=collect_diagnostics,
+            alphabet=resolved,
+            device=device,
+            dtype=dtype,
+            progress=progress,
+            is_cancelled=is_cancelled,
+            **kwargs,
+        )
+        artifacts: dict[str, Any] = {}
+        if folder is not None:
+            artifacts.update(result.save_bundle(folder, label=label))
+            if collect_diagnostics:
+                artifacts.update(result.save_diagnostic_plots(folder, label=label))
+        if fasta_output is not None:
+            artifacts["output_fasta"] = result.to_fasta(fasta_output)
+        return _sampling_summary(result, limit=limit, artifacts=json_safe(artifacts))
+
+    return await _dispatch(
+        ctx, kind="sampling", background=background, parameters=parameters, work=work
+    )
+
+
+# ---------------------------------------------------------------------------
+# Alignments
+
+
+@mcp.tool()
+@surface_errors
 def preprocess_dca_alignment(
     input_path: str,
     output_path: str,
@@ -548,14 +755,22 @@ def preprocess_dca_alignment(
     max_gap_fraction: float | None = None,
     remove_duplicates: bool = False,
     alphabet: str | None = None,
+    unknown_tokens: Literal["gap", "remove", "error"] | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Convert and clean an alignment, writing canonical aligned FASTA output."""
+    """Convert (Stockholm/FASTA) and clean an alignment, writing aligned FASTA.
+
+    Every filter is off unless requested. alphabet="auto" detects protein/RNA/DNA and checks
+    tokens; unknown_tokens decides what happens to symbols outside the alphabet.
+    """
     from adabmDCA import preprocess_alignment
 
-    output = _prepare_file_output(output_path, overwrite=overwrite)
+    output = prepare_file_output(output_path, overwrite=overwrite)
+    kwargs: dict[str, Any] = {}
+    if unknown_tokens is not None:
+        kwargs["unknown_tokens"] = unknown_tokens
     result = preprocess_alignment(
-        input_path,
+        _path(input_path),
         output_path=output,
         input_format=input_format,
         alignment_index=alignment_index,
@@ -563,110 +778,551 @@ def preprocess_dca_alignment(
         max_gap_fraction=max_gap_fraction,
         remove_duplicates=remove_duplicates,
         alphabet=alphabet,
+        **kwargs,
     )
-    return {
-        "output_path": str(result.output_path),
-        "keep_mask": list(result.keep_mask),
-        "report": result.report.to_dict(),
-    }
+    keep = list(result.keep_mask)
+    removed = [index for index, kept in enumerate(keep) if not kept]
+    return compact(
+        {
+            "output_path": str(result.output_path),
+            "input_sequences": len(keep),
+            "kept_sequences": len(keep) - len(removed),
+            "removed_indices": removed,
+            "report": result.report.to_dict(),
+        }
+    )
 
 
 @mcp.tool()
-def train_dca_model(
-    data_path: str,
-    output_dir: str,
-    model_type: Literal["bmDCA", "eaDCA", "edDCA", "edgeDCA"] = "bmDCA",
-    alphabet: str = "protein",
-    learning_rate: float = 0.01,
-    n_sweeps: int = 10,
-    n_chains: int = 10_000,
-    target_pearson: float = 0.95,
-    max_epochs: int = 50_000,
+@surface_errors
+def split_dca_alignment(
+    alignment_path: str,
+    output_prefix: str,
+    method: Literal["clustering", "cobalt"] = "clustering",
+    identity: float = 0.8,
+    train_fraction: float = 0.8,
+    t1: float = 0.5,
+    t2: float = 0.5,
+    t3: float = 1.0,
+    max_train: int | None = None,
+    max_test: int | None = None,
+    attempts: int = 1,
+    alphabet: str = "auto",
     seed: int = 0,
-    device: str = "auto",
-    dtype: str = "float32",
-    label: str | None = None,
+    device: Device = "auto",
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Train a DCA model and persist its artifacts. This may be computationally expensive."""
-    from adabmDCA import train_model
+    """Split an alignment into training and test sets with limited homology between them.
 
-    label = _validated_label(label)
-    output, history_path = _prepare_training_output(
-        output_dir,
-        overwrite=overwrite,
-        label=label,
-    )
-    latest_progress: dict[str, Any] = {}
+    Writes <output_prefix>.train.fasta, .test.fasta and .split.json. "clustering" assigns whole
+    identity clusters to one side; "cobalt" (Petti & Eddy 2022) bounds identities with t1-t3.
+    Use the test set as validation_path for training or test_fasta for sampling diagnostics.
+    """
+    from adabmDCA import split_alignment
 
-    def record_progress(event: Any) -> None:
-        latest_progress.clear()
-        latest_progress.update({"epoch": event.epoch, "metrics": event.metrics})
-
-    result = train_model(
-        data_path,
-        output_dir=output,
-        label=label,
-        model_type=model_type,
-        alphabet=alphabet,
-        learning_rate=learning_rate,
-        n_sweeps=n_sweeps,
-        n_chains=n_chains,
-        target_pearson=target_pearson,
-        max_epochs=max_epochs,
+    alignment_path = _path(alignment_path)
+    prefix = Path(output_prefix).expanduser()
+    for suffix in (".train.fasta", ".test.fasta", ".split.json"):
+        prepare_file_output(str(prefix.with_suffix(prefix.suffix + suffix)), overwrite=overwrite)
+    resolved = resolve_alphabet(alphabet, data=alignment_path)
+    result = split_alignment(
+        alignment_path,
+        method=method,
+        identity=identity,
+        train_fraction=train_fraction,
+        t1=t1,
+        t2=t2,
+        t3=t3,
+        max_train=max_train,
+        max_test=max_test,
+        attempts=attempts,
+        alphabet=resolved,
         seed=seed,
         device=device,
-        dtype=dtype,
-        progress=record_progress,
     )
-    history_path.write_text(
-        json.dumps(_json_safe(result.history), indent=2, allow_nan=False) + "\n",
-        encoding="utf-8",
+    artifacts = result.save_bundle(prefix)
+    return json_safe(
+        {
+            "method": result.method,
+            "training_sequences": len(result.training.sequences),
+            "test_sequences": len(result.test.sequences),
+            "score": result.score,
+            "attempts": result.attempts,
+            "identity": result.identity,
+            "train_fraction": result.train_fraction,
+            "seed": result.seed,
+            "alphabet": resolved,
+            "artifacts": artifacts,
+        }
     )
-    artifacts = {name: str(path) for name, path in result.artifacts.items()}
-    artifacts["history"] = str(history_path)
-    final_progress = _json_safe(latest_progress)
-    epochs_completed = int(latest_progress.get("epoch", 0))
-    final_pearson = latest_progress.get("metrics", {}).get("Pearson")
-    inferred_converged = (
-        final_pearson is not None
-        and math.isfinite(float(final_pearson))
-        and (float(final_pearson) >= target_pearson)
-    )
-    native_converged = getattr(result, "converged", None)
-    converged = inferred_converged if native_converged is None else bool(native_converged)
-    native_stop_reason = getattr(result, "stop_reason", None)
-    stop_reason = (
-        str(native_stop_reason)
-        if native_stop_reason is not None
-        else ("target_pearson" if converged else "unknown")
-    )
+
+
+# ---------------------------------------------------------------------------
+# Training
+
+
+def _ptt_config(ptt: bool, ptt_options: dict[str, Any] | None):
+    if not ptt:
+        if ptt_options:
+            raise ValueError("ptt_options requires ptt=true.")
+        return None
+    from adabmDCA import PTTConfig
+
+    return PTTConfig(**(ptt_options or {}))
+
+
+def _history_tail(history: dict[str, Any], rows: int) -> dict[str, Any]:
+    return {key: list(values)[-rows:] for key, values in (history or {}).items()}
+
+
+def _training_summary(
+    result: Any, *, label: str | None, artifacts: dict[str, Any]
+) -> dict[str, Any]:
+    initialization = result.initialization
     warnings = list(result.warnings)
-    if not converged:
-        warnings.append(
-            f"Training stopped after {epochs_completed} epochs without reaching "
-            f"target Pearson {target_pearson}."
-        )
-    return _json_safe(
+    if not result.converged:
+        warnings.append(f"Training stopped without converging (stop_reason={result.stop_reason}).")
+    return compact(
         {
             "model": _metadata_dict(result.model.metadata),
+            "label": label,
+            "converged": result.converged,
+            "stop_reason": result.stop_reason,
+            "gradient_steps": result.gradient_steps,
+            "structure_steps": result.structure_steps,
+            "sweeps": result.sweeps,
+            "final_metrics": result.final_metrics,
+            "history_tail": _history_tail(result.history, 5),
             "pseudocount": result.pseudocount,
             "num_sequences": result.num_sequences,
             "effective_sequences": result.effective_sequences,
+            "training_data": None if initialization is None else initialization.training,
+            "validation_data": None if initialization is None else initialization.validation,
+            "runtime": None
+            if initialization is None
+            else {
+                "device": initialization.device,
+                "dtype": initialization.dtype,
+                "n_chains": initialization.n_chains,
+            },
+            "config": result.config,
+            "partition_estimate": result.partition_estimate,
+            "input_report": result.input_report,
             "artifacts": artifacts,
-            "label": label,
-            "epochs_completed": epochs_completed,
-            "converged": converged,
-            "stop_reason": stop_reason,
-            "gradient_steps": getattr(result, "gradient_steps", None),
-            "structure_steps": getattr(result, "structure_steps", None),
-            "sweeps": getattr(result, "sweeps", None),
-            "target_pearson": target_pearson,
-            "final_progress": final_progress,
-            "input_report": getattr(result, "input_report", None),
             "warnings": warnings,
         }
     )
+
+
+@mcp.tool()
+@surface_errors
+async def train_dca_model(
+    data_path: str,
+    output_dir: str,
+    model_type: ModelType = "bmDCA",
+    alphabet: str = "auto",
+    label: str | None = None,
+    validation_path: str | None = None,
+    weights_path: str | None = None,
+    learning_rate: float | None = None,
+    n_sweeps: int | None = None,
+    sampler: Sampler | None = None,
+    n_chains: int | None = None,
+    target_pearson: float | None = None,
+    max_epochs: int | None = None,
+    max_gradient_steps: int | None = None,
+    max_structure_steps: int | None = None,
+    pseudocount: float | None = None,
+    l2_regularization: float | None = None,
+    clustering_seqid: float | None = None,
+    no_reweighting: bool = False,
+    target_density: float | None = None,
+    decimation_rate: float | None = None,
+    activation_steps: int | None = None,
+    activation_fraction: float | None = None,
+    checkpoint_interval: int | None = None,
+    initial_params_path: str | None = None,
+    initial_chains_path: str | None = None,
+    ptt: bool = False,
+    ptt_options: dict[str, Any] | None = None,
+    ptt_resume: str | None = None,
+    seed: int = 0,
+    device: Device = "auto",
+    dtype: Literal["float32", "float64", "bfloat16"] = "float32",
+    overwrite: bool = False,
+    background: bool = False,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Train a DCA model with adabmDCA and write its artifacts. Computationally expensive.
+
+    Options left null use adabmDCA's defaults (which differ for PTT). Model types: bmDCA
+    (dense), eaDCA (edge activation; target_density/activation_*), edDCA (decimation;
+    target_density/decimation_rate), edgeDCA (sparse, PCD only).
+    - validation_path tracks held-out log-likelihood (from split_dca_alignment).
+    - ptt=true trains with Parallel Trajectory Tempering (bmDCA/eaDCA); ptt_options are
+      PTTConfig fields, e.g. {"validation_stop": true} to stop at the validation plateau.
+      ptt_resume continues from a ptt.h5 archive (writes into the same files).
+    - initial_params_path / initial_chains_path restart or fine-tune from a previous run.
+    - background=true returns a job id immediately; follow it with get_dca_job.
+    Writes <label>_params.dat.gz, history.csv, events.jsonl, chains, weights, a JSON summary
+    (training.json) and, with PTT, ptt.h5.
+    """
+    from adabmDCA import train_model
+
+    label = validated_label(label)
+    data_path = _path(data_path)
+    use_ptt = ptt or ptt_resume is not None
+    names = training_artifact_names(label, ptt=use_ptt)
+    output = prepare_output_dir(
+        output_dir,
+        managed_names=names.values(),
+        overwrite=overwrite or ptt_resume is not None,
+    )
+    resolved = resolve_alphabet(
+        alphabet, model=_path(ptt_resume) or _path(initial_params_path), data=data_path
+    )
+    ptt_config = _ptt_config(use_ptt, ptt_options)
+
+    optional = {
+        "learning_rate": learning_rate,
+        "n_sweeps": n_sweeps,
+        "sampler": sampler,
+        "n_chains": n_chains,
+        "target_pearson": target_pearson,
+        "max_epochs": max_epochs,
+        "l2_regularization": l2_regularization,
+        "clustering_seqid": clustering_seqid,
+        "target_density": target_density,
+        "decimation_rate": decimation_rate,
+        "activation_steps": activation_steps,
+        "activation_fraction": activation_fraction,
+        "checkpoint_interval": checkpoint_interval,
+    }
+    kwargs = {key: value for key, value in optional.items() if value is not None}
+    parameters = {
+        "data_path": data_path,
+        "output_dir": str(output),
+        "model_type": model_type,
+        "label": label,
+        "ptt": use_ptt,
+        **kwargs,
+    }
+
+    def work(progress: Progress, is_cancelled: IsCancelled) -> dict[str, Any]:
+        result = train_model(
+            data_path,
+            model_type=model_type,
+            ptt=ptt_config,
+            ptt_resume=_path(ptt_resume),
+            validation_path=_path(validation_path),
+            weights_path=_path(weights_path),
+            output_dir=output,
+            label=label,
+            initial_params_path=_path(initial_params_path),
+            initial_chains_path=_path(initial_chains_path),
+            alphabet=resolved,
+            max_gradient_steps=max_gradient_steps,
+            max_structure_steps=max_structure_steps,
+            pseudocount=pseudocount,
+            seed=seed,
+            no_reweighting=no_reweighting,
+            device=device,
+            dtype=dtype,
+            progress=progress,
+            stage_progress=progress,
+            is_cancelled=is_cancelled,
+            **kwargs,
+        )
+        artifacts = {name: str(path) for name, path in result.artifacts.items()}
+        artifacts.update(
+            {name: str(path) for name, path in result.save_bundle(output, label=label).items()}
+        )
+        return _training_summary(result, label=label, artifacts=artifacts)
+
+    return await _dispatch(
+        ctx, kind="training", background=background, parameters=parameters, work=work
+    )
+
+
+@mcp.tool()
+@surface_errors
+async def reintegrate_dca_model(
+    natural_alignment: str,
+    experimental_alignment: str,
+    adjustments: str | list[float],
+    output_dir: str,
+    label: str = "reintegrated",
+    lambda_value: float | None = None,
+    natural_weights: str | None = None,
+    model_type: ModelType = "bmDCA",
+    alphabet: str = "auto",
+    target_pearson: float | None = None,
+    max_epochs: int | None = None,
+    n_chains: int | None = None,
+    learning_rate: float | None = None,
+    pseudocount: float | None = None,
+    initial_params_path: str | None = None,
+    initial_chains_path: str | None = None,
+    ptt: bool = False,
+    ptt_options: dict[str, Any] | None = None,
+    ptt_resume: str | None = None,
+    seed: int = 0,
+    device: Device = "auto",
+    dtype: Literal["float32", "float64", "bfloat16"] = "float32",
+    overwrite: bool = False,
+    background: bool = False,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Retrain a DCA model with experimental feedback on tested sequences.
+
+    adjustments gives one signed score per experimental sequence (a file path or a list),
+    e.g. +1 functional and -1 non-functional. lambda_value weighs the experimental data
+    (default 1/max|adjustment|). Files are labelled '<label>-lambda_<value>'.
+    """
+    from adabmDCA import TrainingConfig, reintegrate_model
+
+    label = validated_label(label) or "reintegrated"
+    natural_alignment = _path(natural_alignment)
+    experimental_alignment = _path(experimental_alignment)
+    output = prepare_output_dir(
+        output_dir,
+        managed_prefixes=[f"{label}-lambda_"],
+        overwrite=overwrite or ptt_resume is not None,
+    )
+    resolved = resolve_alphabet(alphabet, data=natural_alignment)
+    optional = {
+        "target_pearson": target_pearson,
+        "max_epochs": max_epochs,
+        "n_chains": n_chains,
+        "learning_rate": learning_rate,
+        "pseudocount": pseudocount,
+    }
+    config = TrainingConfig(
+        model_type=model_type,
+        alphabet=resolved or "protein",
+        seed=seed,
+        device=device,
+        dtype=dtype,
+        ptt=_ptt_config(ptt or ptt_resume is not None, ptt_options),
+        **{key: value for key, value in optional.items() if value is not None},
+    )
+    adjustment_input = (
+        _path(adjustments) if isinstance(adjustments, str) else np.asarray(adjustments, dtype=float)
+    )
+    parameters = {
+        "natural_alignment": natural_alignment,
+        "experimental_alignment": experimental_alignment,
+        "output_dir": str(output),
+        "label": label,
+        "lambda_value": lambda_value,
+        "model_type": model_type,
+    }
+
+    def work(progress: Progress, is_cancelled: IsCancelled) -> dict[str, Any]:
+        result = reintegrate_model(
+            natural_alignment,
+            experimental_alignment,
+            adjustment_input,
+            config=config,
+            natural_weights=_path(natural_weights),
+            lambda_value=lambda_value,
+            output_dir=output,
+            label=label,
+            initial_params_path=_path(initial_params_path),
+            initial_chains_path=_path(initial_chains_path),
+            ptt_resume=_path(ptt_resume),
+            progress=progress,
+            stage_progress=progress,
+            is_cancelled=is_cancelled,
+        )
+        artifacts = {name: str(path) for name, path in result.artifacts.items()}
+        artifacts.update({name: str(path) for name, path in result.save_bundle(output).items()})
+        summary = _training_summary(result.training, label=result.label, artifacts=artifacts)
+        summary["reintegration"] = json_safe(
+            {
+                "lambda_value": result.lambda_value,
+                "scaling_factor": result.scaling_factor,
+                "combined_sequences": len(result.alignment.sequences),
+                "label": result.label,
+            }
+        )
+        return summary
+
+    return await _dispatch(
+        ctx, kind="reintegration", background=background, parameters=parameters, work=work
+    )
+
+
+@mcp.tool()
+@surface_errors
+def plot_dca_training_history(
+    history_path: str,
+    output_dir: str | None = None,
+) -> dict[str, Any]:
+    """Plot every recorded training quantity (Pearson, slope, log-likelihood, density, PTT ...).
+
+    history_path is the run's history.csv (or <label>_history.csv). Writes one PNG per panel
+    plus <label>_overview.png, by default in <label>_plots next to the history file.
+    Also returns the last recorded row.
+    """
+    from adabmDCA.plot_training_log import plot_training_history, read_training_history
+
+    history_path = _path(history_path)
+    written = plot_training_history(history_path, output_dir=_path(output_dir))
+    history, context = read_training_history(history_path)
+    last = history.iloc[-1].to_dict() if not history.empty else {}
+    return compact(
+        {
+            "plots": written,
+            "updates": len(history),
+            "columns": list(history.columns),
+            "last_row": last,
+            "model": context.get("model"),
+            "label": context.get("label"),
+        },
+        max_items=40,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entropy
+
+
+@mcp.tool()
+@surface_errors
+async def estimate_dca_entropy(
+    model_path: str,
+    method: Literal["thermodynamic_integration", "ptt"] = "thermodynamic_integration",
+    natural_alignment: str | None = None,
+    target_alignment: str | None = None,
+    output_dir: str | None = None,
+    label: str = "entropy",
+    n_chains: int = 8_192,
+    n_sweeps: int = 100,
+    n_steps: int = 100,
+    theta_max: float = 5.0,
+    target_fraction: float = 0.1,
+    sampler: Sampler = "metropolized_gibbs",
+    alphabet: str = "auto",
+    seed: int = 0,
+    device: Device = "auto",
+    dtype: str = "float32",
+    overwrite: bool = False,
+    background: bool = False,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Estimate the entropy (nats) of a DCA model.
+
+    - "thermodynamic_integration": any parameter file; needs natural_alignment and a
+      target_alignment whose first sequence is the integration target.
+    - "ptt": a PTT archive (ptt.h5); cheap, uses the stored PTT bridges (n_sweeps sweeps).
+    """
+    label = validated_label(label) or "entropy"
+    model_path = _path(model_path)
+    folder = None
+    if output_dir is not None:
+        folder = prepare_output_dir(
+            output_dir,
+            managed_names=[f"{label}.json", f"{label}.csv", f"{label}.log"],
+            overwrite=overwrite,
+        )
+    parameters = {"model_path": model_path, "method": method, "output_dir": _path(output_dir)}
+
+    if method == "ptt":
+        from adabmDCA import estimate_ptt_entropy
+
+        def work(progress: Progress, is_cancelled: IsCancelled) -> dict[str, Any]:
+            result = estimate_ptt_entropy(
+                model=model_path,
+                n_sweeps=n_sweeps,
+                seed=seed,
+                device="cpu" if device == "auto" else device,
+                alphabet=None if alphabet == "auto" else alphabet,
+                output_dir=folder,
+                label=label,
+                is_cancelled=is_cancelled,
+            )
+            return json_safe(result.to_dict()["data"])
+
+    else:
+        if natural_alignment is None or target_alignment is None:
+            raise ValueError(
+                "Thermodynamic integration needs natural_alignment and target_alignment."
+            )
+        from adabmDCA import estimate_entropy
+
+        natural_alignment, target_alignment = _path(natural_alignment), _path(target_alignment)
+        resolved = resolve_alphabet(alphabet, model=model_path, data=natural_alignment)
+
+        def work(progress: Progress, is_cancelled: IsCancelled) -> dict[str, Any]:
+            result = estimate_entropy(
+                model=model_path,
+                natural_alignment=natural_alignment,
+                target_alignment=target_alignment,
+                n_chains=n_chains,
+                n_sweeps=n_sweeps,
+                n_steps=n_steps,
+                theta_max=theta_max,
+                target_fraction=target_fraction,
+                sampler=sampler,
+                alphabet=resolved,
+                seed=seed,
+                device=device,
+                dtype=dtype,
+                output_dir=folder,
+                label=label,
+                progress=progress,
+                is_cancelled=is_cancelled,
+            )
+            return compact(
+                {
+                    "entropy": result.entropy,
+                    "free_energy": result.free_energy,
+                    "theta_max": result.theta_max,
+                    "target_fraction": result.target_fraction,
+                    "integration_steps": len(next(iter(result.history.values()), [])),
+                    "model": _metadata_dict(result.model),
+                    "artifacts": result.artifacts,
+                }
+            )
+
+    return await _dispatch(
+        ctx, kind="entropy", background=background, parameters=parameters, work=work
+    )
+
+
+# ---------------------------------------------------------------------------
+# Background jobs
+
+
+@mcp.tool()
+@surface_errors
+def get_dca_job(job_id: str, wait_seconds: float = 0.0) -> dict[str, Any]:
+    """Report a background job: status, latest progress and, when finished, its result.
+
+    wait_seconds (max 300) blocks until the job finishes or the time elapses.
+    """
+    if wait_seconds < 0:
+        raise ValueError("wait_seconds cannot be negative.")
+    if wait_seconds:
+        job = JOBS.wait(job_id, timeout=min(wait_seconds, 300.0))
+    else:
+        job = JOBS.get(job_id)
+    return job.to_dict()
+
+
+@mcp.tool()
+@surface_errors
+def list_dca_jobs() -> dict[str, Any]:
+    """List background jobs started by this server process (results omitted)."""
+    return {"jobs": [job.to_dict(include_result=False) for job in JOBS.list()]}
+
+
+@mcp.tool()
+@surface_errors
+def cancel_dca_job(job_id: str) -> dict[str, Any]:
+    """Ask a running background job to stop. adabmDCA stops at the next safe point."""
+    return JOBS.cancel(job_id).to_dict(include_result=False)
 
 
 def main() -> None:
