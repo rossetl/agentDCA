@@ -266,16 +266,18 @@ def score_dca_sequences(
     device: Device = "auto",
     dtype: str = "float32",
     remove_duplicates: bool = False,
-    local_lambda: float | None = 1.0,
+    local_lambda: float | None = None,
     output_csv: str | None = None,
     overwrite: bool = False,
     max_inline_sequences: int = 100,
 ) -> dict[str, Any]:
     """Compute DCA energies (lower = more probable under the model) for aligned sequences.
 
-    Also returns the summed context-dependent entropy (cde_sum) and the local free energy
-    energy - local_lambda * cde_sum; set local_lambda=null to skip them. Writes every record
-    to output_csv when given and returns a bounded preview.
+    With local_lambda, also returns the summed context-dependent entropy (cde_sum) and the
+    local free energy energy - local_lambda * cde_sum. Use the lambda fitted by a converged
+    sampling run of the same model (local_lambda_fit of sample_dca_sequences); without it,
+    only energies are computed. Writes every record to output_csv when given and returns a
+    bounded preview.
     """
     from adabmDCA import score_sequences
 
