@@ -289,7 +289,8 @@ def test_score_writes_all_records_and_bounds_inline_payload(tmp_path, monkeypatc
         warnings=(),
         to_csv=to_csv,
     )
-    _fake_adabmdca(monkeypatch, score_sequences=lambda **kwargs: result)
+    calls = []
+    _fake_adabmdca(monkeypatch, score_sequences=lambda **kwargs: calls.append(kwargs) or result)
     output = tmp_path / "scores.csv"
 
     response = score_dca_sequences(
@@ -307,6 +308,8 @@ def test_score_writes_all_records_and_bounds_inline_payload(tmp_path, monkeypatc
     assert response["cde_sum"] == pytest.approx([0.1, 0.2])
     assert response["energy_stats"]["max"] == 3.0
     assert written["path"] == output
+    # Without a fitted lambda, no local free energy is requested.
+    assert calls[0]["local_lambda"] is None
 
 
 def _sampling_result():
