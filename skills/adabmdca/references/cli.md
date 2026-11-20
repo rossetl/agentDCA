@@ -38,7 +38,7 @@ Writes `<prefix>.train.fasta`, `<prefix>.test.fasta`, `<prefix>.split.json`. Clu
 adabmDCA train -d train.fasta -v validation.fasta -o model --no-progress > train.out 2>&1 &
 ```
 
-Default: bmDCA, PTT, 2048 chains, 10 Metropolized Gibbs sweeps per exchange round, lr 0.01, adaptive optimizer. With `-v` training stops at the validation plateau; without it at Pearson `--target` 0.95.
+Default: bmDCA, PTT, 10240 chains, 10 Metropolized Gibbs sweeps per exchange round, lr 0.01, adaptive optimizer. With `-v` training stops at the validation plateau; without it at Pearson `--target` 0.95.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -48,7 +48,9 @@ Default: bmDCA, PTT, 2048 chains, 10 Metropolized Gibbs sweeps per exchange roun
 | `-l`, `--label` | none | Prefix of output files |
 | `-m`, `--model` | `bmDCA` | `bmDCA`, `eaDCA` (PTT or PCD), `edDCA`, `edgeDCA` (PCD only) |
 | `--strategy` | `ptt` | `ptt` or `pcd` |
-| `--nchains` | 2048 | Chains (per replica with PTT) |
+| `--anchor` | `tree-low-rank` | bmDCA from scratch: starting model, also `low-rank`, `tree` or `profile`; the ladder bottom with PTT, the initial parameters and chains with PCD |
+| `--anchor-rank` | 2 | Hidden units of the low-rank anchors, 1 to 3 |
+| `--nchains` | 10240 | Chains (per replica with PTT) |
 | `--nsweeps` | 10 | Sweeps per update (PCD) or per exchange round (PTT) |
 | `--sampler` | `metropolized_gibbs` | `gibbs`, `metropolis` |
 | `--lr` | 0.01 | Learning rate (upper bound for the adaptive PTT optimizer) |
@@ -73,7 +75,7 @@ PTT has about thirty `--ptt-*` options; the defaults rarely need changing. The o
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--ptt-validation-stop` / `--no-ptt-validation-stop` | on with `-v` | Stop at the validation plateau |
-| `--ptt-validation-window` | 200 | Updates per compared window |
+| `--ptt-validation-window` | 100 | Updates per compared window |
 | `--ptt-validation-min-gain` | 0 | Minimal gain between windows |
 | `--ptt-target-acceptance` | 0.25 | Swap acceptance that triggers a snapshot insertion |
 | `--ptt-optimizer` | `adaptive` | `sgd` uses the fixed `--lr` |
@@ -86,6 +88,7 @@ Common variants:
 
 ```bash
 adabmDCA train --strategy pcd -d train.fasta -o model_pcd                         # fast first look
+adabmDCA train -d train.fasta -v validation.fasta -o model --anchor profile      # PTT from the profile instead of the anchor
 adabmDCA train -d train.fasta -v validation.fasta -o model --nsweeps 100          # after trapped configurations
 adabmDCA train -m eaDCA -d train.fasta -v validation.fasta -o model_ea            # sparse, PTT
 adabmDCA train --strategy pcd -m edDCA -d train.fasta -o model_ed --density 0.02  # decimated, PCD only
@@ -109,10 +112,10 @@ Outputs (in `-o`): `params.dat.gz`, `chains.fasta`, `weights.dat`, `history.csv`
 
 ```bash
 # Default whenever the training folder has a ptt.h5: PTT through the archived ladder; -d is required
-adabmDCA sample -p model/ptt.h5 -d train.fasta -v validation.fasta --plot -o samples
+adabmDCA sample -p model/ptt.h5 -d train.fasta -v validation.fasta --plot-sampling-logs -o samples
 
 # Plain MCMC: only when there is no ptt.h5 (PCD-trained or imported models), or as a cross-check
-adabmDCA sample --strategy pcd -p model/params.dat.gz -d train.fasta --plot -o samples_mcmc
+adabmDCA sample --strategy mcmc -p model/params.dat.gz -d train.fasta --plot-sampling-logs -o samples_mcmc
 ```
 
 | Option | Default | Meaning |
@@ -122,7 +125,7 @@ adabmDCA sample --strategy pcd -p model/params.dat.gz -d train.fasta --plot -o s
 | `--ngen` | training chains per model (PTT), 2048 (MCMC) | Number of sequences |
 | `-d`, `--data` | required for PTT | Reference alignment, normally the training set |
 | `-v`, `--validation` | none | Held-out set: enables the memorization checks (`distances.png`, PRIVET) |
-| `--plot` | off | Diagnostic figures; requires `-d` |
+| `--plot-sampling-logs` | off | Diagnostic figures; requires `-d` |
 | `--ptt-return-full-ladder` | off | Also write `ladder_samples.h5`: `--ngen` samples of every ladder model, profile first, endpoint last |
 | `--ptt-stationary` | off | Renew the ladder a second time (about twice the cost) |
 | `--ptt-max-rounds` | 20000 | Budget of exchange rounds |
@@ -136,7 +139,7 @@ adabmDCA sample --strategy pcd -p model/params.dat.gz -d train.fasta --plot -o s
 
 Sample as many sequences as training chains when comparing Pearson with training (the PTT default does this).
 
-Outputs: `samples.fasta`, `samples.csv` (`name, sequence, energy, cde_sum`, plus PRIVET columns with `-v`), `sampling.json`, `logs/` (`ptt.log` has log Z, mean energy, entropy and data log-likelihood of every ladder model), and with `--plot`: `cij_scatter.png`, `pca_1_2.png`, `pca_3_4.png`, `data_vs_samples.png`, `distances.png`, `energy_vs_cde.png`, plus `ptt_renewal.png`, `ptt_ladder_health.png` (PTT) or `autocorrelation.png`, `pearson_sampling.png` (MCMC).
+Outputs: `samples.fasta`, `samples.csv` (`name, sequence, energy, cde_sum`, plus PRIVET columns with `-v`), `sampling.json`, `logs/` (`ptt.log` has log Z, mean energy, entropy and data log-likelihood of every ladder model), and with `--plot-sampling-logs`: `statistics_scatter.png` (single-site frequencies, Cij, three-point correlations), `pca_1_2.png`, `pca_3_4.png`, `data_vs_samples.png`, `distances.png`, `energy_vs_cde.png`, plus `ptt_renewal.png`, `ptt_ladder_health.png` (PTT) or `autocorrelation.png`, `pearson_sampling.png` (MCMC).
 
 ## energies
 
@@ -167,7 +170,7 @@ Writes `contact_map.csv` (`position_i, position_j, score` for every pair, diagon
 
 ```bash
 adabmDCA entropy -p model/ptt.h5 -o entropy                                              # PTT bridge, seconds to minutes
-adabmDCA entropy --strategy pcd -p model/params.dat.gz -d train.fasta -t target.fasta -o entropy_ti   # thermodynamic integration
+adabmDCA entropy --strategy mcmc -p model/params.dat.gz -d train.fasta -t target.fasta -o entropy_ti   # thermodynamic integration
 ```
 
 PTT writes `entropy.json` with `entropy`, `log_z`, `mean_energy`, `free_energy`. Thermodynamic integration (any model, needs chains that mix) writes `entropy.log`, `entropy.csv`, `entropy.json`; options `--nchains` (8192), `--nsteps` (100), `--nsweeps` (100), `--theta_max` (5). Values are in nats per sequence; training logs report per-site log-likelihoods.

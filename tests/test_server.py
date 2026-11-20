@@ -24,7 +24,6 @@ from agentdca._common import (
 from agentdca.jobs import JobStore, WorkerContext, progress_snapshot
 from agentdca.models import ModelCache
 from agentdca.server import (
-    _hamming_potential,
     _top_contacts,
     compare_dca_contacts,
     diagnose_dca_run,
@@ -212,11 +211,6 @@ def test_surface_errors_exposes_adabmdca_messages():
         broken()
 
 
-def test_hamming_potential_counts_mismatches():
-    potential = _hamming_potential("AC-G")
-    assert list(potential(["AC-G", "AA-G", "----"], 2.0)) == [0.0, 2.0, 6.0]
-
-
 def test_progress_snapshot_keeps_metrics_and_drops_none():
     event = SimpleNamespace(epoch=4, metrics={"Pearson": np.float32(0.5)}, stage="optimization")
     assert progress_snapshot(event) == {
@@ -367,20 +361,66 @@ def test_sample_writes_all_sequences_and_bounds_inline_payload(tmp_path, monkeyp
     assert received["ptt"] is False
 
 
+def _fake_steering(monkeypatch, **functions):
+    from adabmDCA import HammingBias, HammingWindow, SteeringConfig, WeightedPotential
+
+    _fake_adabmdca(monkeypatch, HammingBias=HammingBias, HammingWindow=HammingWindow,
+                   SteeringConfig=SteeringConfig, WeightedPotential=WeightedPotential, **functions)
+
+
 def test_sample_validates_ptt_and_steering_inputs(monkeypatch):
-    _fake_adabmdca(monkeypatch, sample_sequences=lambda **kwargs: _sampling_result())
+    _fake_steering(monkeypatch, sample_sequences=lambda **kwargs: _sampling_result())
     with pytest.raises(ToolError, match="reference_fasta"):
         asyncio.run(sample_dca_sequences("ptt.h5", n_sequences=2, ptt=True, alphabet="protein"))
-    with pytest.raises(ToolError, match="at most one"):
+    with pytest.raises(ToolError, match="own diagnostics"):
         asyncio.run(
             sample_dca_sequences(
-                "params.dat",
-                n_sequences=2,
-                alphabet="protein",
-                steering_target="AA",
-                steering_script="x.py:f",
+                "params.dat", n_sequences=2, alphabet="protein", allowed_tokens="A",
+                reference_fasta="data.fasta", collect_diagnostics=True,
             )
         )
+    with pytest.raises(ToolError, match="exactly the keys"):
+        asyncio.run(
+            sample_dca_sequences("params.dat", n_sequences=2, alphabet="protein",
+                                 windows=[{"reference": "AA", "maximum": 1}])
+        )
+
+
+def test_sample_builds_the_steering_config(tmp_path, monkeypatch):
+    received = {}
+
+    def fake_sample(**kwargs):
+        received.update(kwargs)
+        result = _sampling_result()
+        result.steering = {
+            "status": "converged", "warmup_rounds": 40, "pilot_rounds": 8,
+            "observables": {"potts_energy": {"rhat": 1.004, "bulk_ess": 90.0, "tail_ess": 120.0}},
+            "old_configurations_per_chain": 0.0, "ladder": ["archive anchor", "steering 1"],
+            "constraint_distances": [[1], [2], [2]], "history": {"warmup": [{"round": 1}] * 500},
+        }
+        return result
+
+    _fake_steering(monkeypatch, sample_sequences=fake_sample)
+    script = tmp_path / "cost.py"
+    script.write_text("def gc(sequences):\n    return [s.count('G') for s in sequences]\n")
+    response = asyncio.run(
+        sample_dca_sequences(
+            "ptt.h5", n_sequences=3, ptt=True, beta=2.0, alphabet="rna",
+            allowed_tokens="ACGU", windows=[{"reference": "AC", "minimum": 0, "maximum": 2}],
+            distance_biases=[{"reference": "AG", "weight": 0.5}],
+            potential_script=f"{script}:gc", potential_weight=0.25,
+            steering_chains=16, steering_warmup_seconds=30.0, steering_entropy=True,
+        )
+    )
+    config = received["steering"]
+    assert config.allowed_tokens == "ACGU" and config.chains == 16 and config.entropy
+    assert (config.windows[0].reference, config.windows[0].minimum, config.windows[0].maximum) == ("AC", 0, 2)
+    assert config.distance_biases[0].weight == 0.5
+    assert config.potentials[0].weight == 0.25 and config.potentials[0].evaluate(["GG"]) == [2]
+    steering = response["steering"]
+    assert steering["status"] == "converged" and steering["max_rhat"] == pytest.approx(1.004)
+    assert steering["window_distances"] == [{"min": 1.0, "mean": pytest.approx(5 / 3), "max": 2.0}]
+    assert "history" not in steering
 
 
 def test_contacts_write_complete_symmetrized_matrix(tmp_path, monkeypatch):

@@ -45,16 +45,16 @@ Healthy `history.csv`:
 ## 3. Check the finished model
 
 ```bash
-adabmDCA sample -p model/ptt.h5 -d train.fasta -v validation.fasta --plot -o check
+adabmDCA sample -p model/ptt.h5 -d train.fasta -v validation.fasta --plot-sampling-logs -o check
 ```
 
 1. `sampling.json` → `ptt_diagnostics.converged` must be true. If not, do not use the samples.
 2. Sampled Pearson (`ptt_diagnostics.final_pearson`) vs last training `pearson`, at the same number of sequences as training chains: a healthy model loses 0.003–0.007; more than ~0.01 deserves attention.
-3. `ptt_ladder_health.png`: trapped-configuration bars above 2 flag stuck links.
+3. `ptt_ladder_health.png`: trapped-configuration bars are grey (within chance), amber (slow, still renewed) or red (blocking renewal); a red title means renewal failed.
 4. `pca_1_2.png`, `data_vs_samples.png`: every data cluster covered, share ratios roughly ×0.8–×1.25.
 5. `distances.png` (needs `-v`): generated sequences not closer to training than held-out ones; none identical to a training sequence.
 
-PCD models (no ladder): `sample --strategy pcd -p model_pcd/params.dat.gz -d train.fasta --plot --max_nsweeps 10000`. The run must report a mixing time (not hit `--max_nsweeps`), and `pearson_sampling.png` must rise and settle; a rise then decline means trained out of equilibrium. If either fails, retrain with PTT.
+PCD models (no ladder): `sample --strategy mcmc -p model_pcd/params.dat.gz -d train.fasta --plot-sampling-logs --max_nsweeps 10000`. The run must report a mixing time (not hit `--max_nsweeps`), and `pearson_sampling.png` must rise and settle; a rise then decline means trained out of equilibrium. If either fails, retrain with PTT.
 
 ## Decision table
 

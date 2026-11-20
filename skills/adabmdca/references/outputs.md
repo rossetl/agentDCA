@@ -63,8 +63,8 @@ One object per line with `event`, `step`, `utc`, `sweeps` and event-specific fie
 | `samples.csv` | `name, sequence, energy, cde_sum` (+ PRIVET columns with `-v`) |
 | `sampling.json` | Settings, mixing outcome, every diagnostic as numbers |
 | `ladder_samples.h5` | With `--ptt-return-full-ladder` |
-| `logs/` | `mix.log`, `sampling.log`, `data_vs_samples.log`, `distances.log`; PTT: `ptt.log`, `ptt_renewal.log`, `ptt_ladder_health.log`, `ptt_replicas.log` |
-| `*.png` | With `--plot`; see [cli.md](cli.md#sample) |
+| `logs/` | `mix.log`, `sampling.log`, `data_vs_samples.log`, `distances.log`, `three_point.log`; PTT: `ptt.log`, `ptt_renewal.log`, `ptt_ladder_health.log`, `ptt_ages.npz` (per-configuration ages and swap probabilities) |
+| `*.png` | With `--plot-sampling-logs`; see [cli.md](cli.md#sample) |
 
 `sampling.json` → `data` keys: `sequences`, `energies`, `cde_sum`, `num_sweeps`, `sampler`, `seed`, `model`, `local_lambda_fit` (slope λ, intercept, R² of energy vs CDE), `data_comparison`, `distance_comparison`, `mixing_history`, `sampling_history`, `warnings`, and for PTT `ptt_diagnostics` with `converged`, `final_pearson`, `final_slope`, `mixing`, `ladder_health`, `models`, `timings_seconds`.
 
@@ -74,7 +74,7 @@ d = json.load(open("samples/sampling.json"))["data"]
 d["ptt_diagnostics"]["converged"], d["ptt_diagnostics"]["final_pearson"], d["warnings"]
 ```
 
-`logs/ptt.log` (CSV): one row per ladder model, profile first: `replica, model_id, log_z, log_z_forward, log_z_estimator, mean_energy, entropy, log_likelihood, log_likelihood_per_residue, steering_strength, sample_round, n_chains, training_step, flag` (`flag` is `ptt` for the profile and `final` for the endpoint).
+`logs/ptt.log` (CSV): one row per ladder model, profile first: `replica, model_id, log_z, log_z_forward, log_z_estimator, mean_energy, entropy, log_likelihood, log_likelihood_per_residue, sample_round, n_chains, training_step, flag` (`flag` is `ptt` for the profile and `final` for the endpoint).
 
 ### `ladder_samples.h5`
 

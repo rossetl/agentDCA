@@ -40,7 +40,7 @@ cannot give:
 | `predict_dca_contacts` | Ranked APC-corrected contacts from a model or mean-field DCA; full matrix export |
 | `compare_dca_contacts` | Side-by-side mean-field/model contact heatmaps (shared or per-panel scale), returned as an image |
 | `scan_dca_mutations` | All single substitutions of a wild type, ranked; full CSV export |
-| `sample_dca_sequences` | MCMC or PTT sampling, diagnostics against data (Cij, PCA, distances, PRIVET) with plots returned as images, steered sampling |
+| `sample_dca_sequences` | MCMC or PTT sampling, diagnostics against data (Cij, PCA, distances, PRIVET) with plots returned as images, steered sampling (allowed letters, Hamming windows and biases, scripted costs, low temperature) |
 | `estimate_dca_entropy` | Entropy by thermodynamic integration or from a PTT archive |
 | `get_dca_job`, `list_dca_jobs`, `cancel_dca_job` | Follow, find and stop runs started with `background=true`, from any session |
 
@@ -164,7 +164,7 @@ disables the cache).
 - Non-finite scientific metrics are returned as JSON `null`.
 - Errors carry adabmDCA's error class, code, message and details instead of a generic
   failure.
-- `steering_script` executes a user-provided Python file inside the server; only point it at
+- `potential_script` executes a user-provided Python file inside the server; only point it at
   code you trust.
 
 ## Development setup

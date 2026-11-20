@@ -570,40 +570,90 @@ def scan_dca_mutations(
 # Sampling
 
 
-def _hamming_potential(target: str):
-    target_array = np.frombuffer(target.encode("ascii"), dtype=np.uint8)
-
-    def potential(sequences: Any, strength: float) -> np.ndarray:
-        distances = np.array(
-            [
-                np.count_nonzero(
-                    np.frombuffer(sequence.encode("ascii"), dtype=np.uint8) != target_array
-                )
-                for sequence in sequences
-            ],
-            dtype=float,
-        )
-        return strength * distances
-
-    return potential
-
-
-def _load_steering_script(spec: str):
+def _load_potential_script(spec: str):
     path_text, _, function_name = spec.rpartition(":")
     if not path_text or not function_name:
-        raise ValueError("steering_script must look like '/path/to/potential.py:function_name'.")
+        raise ValueError("potential_script must look like '/path/to/potential.py:function_name'.")
     path = Path(path_text).expanduser()
     if not path.is_file():
-        raise FileNotFoundError(f"Steering script '{path}' was not found.")
+        raise FileNotFoundError(f"Potential script '{path}' was not found.")
     module_spec = importlib.util.spec_from_file_location(f"agentdca_steering_{path.stem}", path)
     if module_spec is None or module_spec.loader is None:
-        raise ImportError(f"Cannot import steering script '{path}'.")
+        raise ImportError(f"Cannot import potential script '{path}'.")
     module = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(module)
     try:
         return getattr(module, function_name)
     except AttributeError:
-        raise AttributeError(f"Steering script '{path}' defines no '{function_name}'.") from None
+        raise AttributeError(f"Potential script '{path}' defines no '{function_name}'.") from None
+
+
+def _steering_config(
+    *,
+    allowed_tokens: str | None,
+    windows: list[dict[str, Any]] | None,
+    distance_biases: list[dict[str, Any]] | None,
+    potential_script: str | None,
+    potential_weight: float,
+    chains: int,
+    warmup_seconds: float | None,
+    entropy: bool,
+):
+    """A SteeringConfig from the tool arguments, or None when nothing is steered."""
+    if not (allowed_tokens or windows or distance_biases or potential_script):
+        return None
+    from adabmDCA import HammingBias, HammingWindow, SteeringConfig, WeightedPotential
+
+    def entries(items, keys, name):
+        result = []
+        for item in items or []:
+            if not isinstance(item, dict) or set(item) != set(keys):
+                raise ValueError(f"Each {name} entry needs exactly the keys {', '.join(keys)}.")
+            result.append(item)
+        return result
+
+    potentials = ()
+    if potential_script is not None:
+        potentials = (WeightedPotential(_load_potential_script(potential_script), weight=potential_weight),)
+    return SteeringConfig(
+        allowed_tokens=allowed_tokens or None,
+        windows=tuple(HammingWindow(item["reference"], int(item["minimum"]), int(item["maximum"]))
+                      for item in entries(windows, ("reference", "minimum", "maximum"), "windows")),
+        distance_biases=tuple(HammingBias(item["reference"], float(item["weight"]))
+                              for item in entries(distance_biases, ("reference", "weight"), "distance_biases")),
+        potentials=potentials,
+        chains=chains,
+        warmup_seconds=warmup_seconds,
+        entropy=entropy,
+    )
+
+
+def _steering_summary(steering: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The convergence verdict of a steered run, without its per-round history."""
+    if not steering:
+        return None
+    observables = steering.get("observables") or {}
+    distances = np.asarray(steering.get("constraint_distances") or [], dtype=float)
+    summary = {
+        "status": steering.get("status"),
+        "warmup_rounds": steering.get("warmup_rounds"),
+        "pilot_rounds": steering.get("pilot_rounds"),
+        "max_rhat": max((item["rhat"] for item in observables.values()), default=None),
+        "min_bulk_ess": min((item["bulk_ess"] for item in observables.values()), default=None),
+        "min_tail_ess": min((item["tail_ess"] for item in observables.values()), default=None),
+        "old_configurations_per_chain": steering.get("old_configurations_per_chain"),
+        "ladder": steering.get("ladder"),
+        "swap_acceptance": steering.get("swap_acceptance"),
+        "potential_seconds": steering.get("potential_seconds"),
+        "entropy": steering.get("entropy"),
+    }
+    if distances.size:
+        distances = distances.reshape(len(distances), -1)
+        summary["window_distances"] = [
+            {"min": float(column.min()), "mean": float(column.mean()), "max": float(column.max())}
+            for column in distances.T
+        ]
+    return summary
 
 
 SAMPLING_PLOT_ORDER = (
@@ -656,7 +706,7 @@ def _sampling_summary(
         "ptt_mixing": ptt.get("mixing"),
         "distances": distance.get("summary"),
         "privet": privet_summary or None,
-        "steering": result.steering or None,
+        "steering": _steering_summary(result.steering),
         "artifacts": artifacts,
         "model": _metadata_dict(result.model),
         "warnings": list(result.warnings),
@@ -689,9 +739,14 @@ async def sample_dca_sequences(
     ptt_stationary: bool = False,
     ptt_local_kernel: Literal["archived", "metropolized_gibbs", "gibbs", "metropolis"] = "archived",
     ptt_return_full_ladder: bool = False,
-    steering_target: str | None = None,
-    steering_script: str | None = None,
-    steering_strength: float = 1.0,
+    allowed_tokens: str | None = None,
+    windows: list[dict[str, Any]] | None = None,
+    distance_biases: list[dict[str, Any]] | None = None,
+    potential_script: str | None = None,
+    potential_weight: float = 1.0,
+    steering_chains: int = 128,
+    steering_warmup_seconds: float | None = None,
+    steering_entropy: bool = False,
     output_dir: str | None = None,
     label: str | None = None,
     output_fasta: str | None = None,
@@ -709,12 +764,20 @@ async def sample_dca_sequences(
     - collect_diagnostics=true (needs reference_fasta) compares samples with the data: Cij
       Pearson, PCA, cluster occupancy, Hamming distances and, with test_fasta, the PRIVET
       overfitting check. With output_dir, diagnostic PNGs are also written.
-    - ptt=true samples a PTT archive (model_path = the training ptt.h5) and needs
-      reference_fasta; it ignores n_sweeps and beta and runs until its mixing check passes.
-    - Steering biases sampling by V(x, s): steering_target pulls samples toward an aligned
-      target sequence (V = s * Hamming distance); steering_script='file.py:function' loads a
-      user-written V(sequences, s). The result carries importance weights back to the
-      unsteered model. steering_script executes that Python file in this server.
+    - ptt=true samples a PTT archive (model_path = the training ptt.h5). Unsteered at beta=1
+      it needs reference_fasta, ignores n_sweeps and runs until its mixing check passes.
+    - Steering restricts and reweights the target; any of these turns it on:
+      allowed_tokens (e.g. "ACGU" to forbid gaps), windows (list of {reference, minimum,
+      maximum}: inclusive substitution budgets from aligned references, all required),
+      distance_biases (list of {reference, weight}: weight per substitution, positive favours
+      the reference) and potential_script='file.py:function' (a function of a list of aligned
+      sequences returning one cost per sequence, multiplied by potential_weight; it runs inside
+      this server). beta > 1 cools the Potts energy. Steered MCMC runs steering_chains chains
+      for up to n_sweeps rounds; steered PTT (ptt=true, beta > 1 alone also steers) starts
+      from the archive's anchor restricted to the windows and runs up to ptt_max_rounds.
+      steering_warmup_seconds caps the wall time, steering_entropy (PTT) estimates log Z and
+      the entropy of the steered target. The steering summary reports status ("converged" or
+      provisional), worst R-hat and ESS, old configurations and window distances.
     - output_dir writes the package bundle (samples FASTA/CSV, JSON summary, logs);
       output_fasta writes only a FASTA.
     - With diagnostics and output_dir, up to max_images plots (Cij scatter, PCA, distances,
@@ -725,11 +788,17 @@ async def sample_dca_sequences(
 
     limit = inline_limit(max_inline_sequences)
     label = validated_label(label)
-    if steering_target is not None and steering_script is not None:
-        raise ValueError("Give at most one of steering_target and steering_script.")
     if collect_diagnostics and reference_fasta is None:
         raise ValueError("collect_diagnostics=true needs reference_fasta.")
-    if ptt and reference_fasta is None:
+    steering = _steering_config(
+        allowed_tokens=allowed_tokens, windows=windows, distance_biases=distance_biases,
+        potential_script=potential_script, potential_weight=potential_weight,
+        chains=steering_chains, warmup_seconds=steering_warmup_seconds, entropy=steering_entropy,
+    )
+    if steering is not None and (collect_diagnostics or ptt_return_full_ladder):
+        raise ValueError("Steered sampling keeps its own diagnostics: drop collect_diagnostics and "
+                         "ptt_return_full_ladder.")
+    if ptt and steering is None and beta == 1.0 and reference_fasta is None:
         raise ValueError("PTT sampling needs reference_fasta (the training alignment).")
     model_path = _path(model_path)
     reference_fasta, test_fasta, weights_path = (
@@ -753,12 +822,6 @@ async def sample_dca_sequences(
             overwrite=overwrite,
         )
     resolved = resolve_alphabet(alphabet, model=model_path, data=reference_fasta)
-    potential = None
-    if steering_target is not None:
-        potential = _hamming_potential(steering_target)
-    elif steering_script is not None:
-        potential = _load_steering_script(steering_script)
-
     parameters = {
         "model_path": model_path,
         "n_sequences": n_sequences,
@@ -769,9 +832,7 @@ async def sample_dca_sequences(
     }
 
     def work(progress: Progress, is_cancelled: IsCancelled) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {}
-        if potential is not None:
-            kwargs.update(steering_potential=potential, steering_strength=steering_strength)
+        kwargs: dict[str, Any] = {} if steering is None else {"steering": steering}
         if ptt:
             source = MODELS.ptt_sampler(model_path, device=device)
         else:

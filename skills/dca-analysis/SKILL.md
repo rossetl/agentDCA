@@ -74,6 +74,11 @@ Defaults:
   PTT sampling mixes through the ladder built in training. Use plain MCMC (the tool's
   default) only for a model without an archive, such as a PCD run or a bare
   `params.dat.gz`, or when the user asks for it.
+- Steered sampling (the `adabmdca-steering` skill explains when and how) uses the same tool:
+  `allowed_tokens`, `windows` (`[{reference, minimum, maximum}]`), `distance_biases`
+  (`[{reference, weight}]`), `potential_script` with `potential_weight`, and `beta` for
+  colder sampling. Prefer `ptt=true` with the `ptt.h5` for low temperature or narrow windows.
+  Report `steering.status`: anything but `converged` gives provisional sequences.
 
 `alphabet="auto"` (the default) detects the alphabet like the CLI.
 
@@ -132,7 +137,7 @@ the same model reuse it; a retrained file is reloaded automatically.
   directory.
 - Responses carry at most `max_inline_sequences` records; write complete results with
   `output_csv`, `output_fasta` or `output_dir` and report the paths.
-- `steering_script` runs a Python file inside the server: only use one the user wrote or
+- `potential_script` runs a Python file inside the server: only use one the user wrote or
   approved.
 - Errors carry adabmDCA's code, message and details: report the message and the setting
   it names; do not retry blindly.
